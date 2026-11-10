@@ -1,0 +1,179 @@
+{
+  "version": "android12-5.10",
+  "include": [
+    {
+      "sublevel": "43",
+      "date": "2021-08",
+      "disabled": true
+    },
+    {
+      "sublevel": "43",
+      "date": "2021-09",
+      "disabled": true
+    },
+    {
+      "sublevel": "43",
+      "date": "2021-10"
+    },
+    {
+      "sublevel": "66",
+      "date": "2021-11",
+      "disabled": true
+    },
+    {
+      "sublevel": "66",
+      "date": "2021-12",
+      "disabled": true
+    },
+    {
+      "sublevel": "66",
+      "date": "2022-01"
+    },
+    {
+      "sublevel": "81",
+      "date": "2022-02",
+      "disabled": true
+    },
+    {
+      "sublevel": "81",
+      "date": "2022-03"
+    },
+    {
+      "sublevel": "101",
+      "date": "2022-04",
+      "disabled": true
+    },
+    {
+      "sublevel": "101",
+      "date": "2022-05"
+    },
+    {
+      "sublevel": "110",
+      "date": "2022-06",
+      "disabled": true
+    },
+    {
+      "sublevel": "110",
+      "date": "2022-07"
+    },
+    {
+      "sublevel": "117",
+      "date": "2022-08",
+      "disabled": true
+    },
+    {
+      "sublevel": "117",
+      "date": "2022-09"
+    },
+    {
+      "sublevel": "136",
+      "date": "2022-10",
+      "disabled": true
+    },
+    {
+      "sublevel": "136",
+      "date": "2022-11"
+    },
+    {
+      "sublevel": "149",
+      "date": "2022-12",
+      "disabled": true
+    },
+    {
+      "sublevel": "149",
+      "date": "2023-01"
+    },
+    {
+      "sublevel": "160",
+      "date": "2023-02",
+      "disabled": true
+    },
+    {
+      "sublevel": "160",
+      "date": "2023-03"
+    },
+    {
+      "sublevel": "168",
+      "date": "2023-04",
+      "disabled": true
+    },
+    {
+      "sublevel": "168",
+      "date": "2023-05"
+    },
+    {
+      "sublevel": "177",
+      "date": "2023-06",
+      "disabled": true
+    },
+    {
+      "sublevel": "177",
+      "date": "2023-07"
+    },
+    {
+      "sublevel": "185",
+      "date": "2023-09"
+    },
+    {
+      "sublevel": "198",
+      "date": "2023-11",
+      "disabled": true
+    },
+    {
+      "sublevel": "198",
+      "date": "2024-01"
+    },
+    {
+      "sublevel": "205",
+      "date": "2024-03"
+    },
+    {
+      "sublevel": "209",
+      "date": "2024-05"
+    },
+    {
+      "sublevel": "218",
+      "date": "2024-08"
+    },
+    {
+      "sublevel": "226",
+      "date": "2024-11"
+    },
+    {
+      "sublevel": "233",
+      "date": "2025-02"
+    },
+    {
+      "sublevel": "236",
+      "date": "2025-05"
+    },
+    {
+      "sublevel": "237",
+      "date": "2025-06"
+    },
+    {
+      "sublevel": "240",
+      "date": "2025-09"
+    },
+    {
+      "sublevel": "246",
+      "date": "2025-12"
+    },
+    {
+      "sublevel": "252",
+      "date": "2026-04"
+    },
+    {
+      "sublevel": "257",
+      "date": "2026-07"
+    },
+    {
+      "sublevel": "269",
+      "date": "2026-10"
+    },
+    {
+      "sublevel": "X",
+      "date": "lts"
+    }
+  ]
+}

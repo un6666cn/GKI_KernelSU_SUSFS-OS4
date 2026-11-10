@@ -1,0 +1,27 @@
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -1210,6 +1225,23 @@ MODULE_PARM_DESC(ignore_loglevel,
+ 
+ static bool suppress_message_printing(int level)
+ {
++	/*
++	 * Meizu 20 port: the stock vendor_boot passes
++	 * "console=ttyMSM0,115200n8 loglevel=7".  The Meizu stock kernel
++	 * gates console output through CONFIG_MZ_CONSOLE_OUTPUT_DYNAMIC;
++	 * plain ACK lacks that gate, so every printk up to KERN_DEBUG is
++	 * written synchronously to the 115200-baud UART and blocks the
++	 * calling thread (visible as system UI jank).
++	 *
++	 * Keep the ring buffer (dmesg) intact but never emit runtime
++	 * messages below KERN_EMERG to the serial console.  The gate lives
++	 * in the console write path, so user space cannot override it via
++	 * /proc/sys/kernel/printk.  Oops/panic output still gets through.
++	 */
++	if (!ignore_loglevel && !oops_in_progress &&
++	    level >= CONSOLE_LOGLEVEL_MIN)
++		return true;
++
+ 	return (level >= console_loglevel && !ignore_loglevel);
+ }
+ 

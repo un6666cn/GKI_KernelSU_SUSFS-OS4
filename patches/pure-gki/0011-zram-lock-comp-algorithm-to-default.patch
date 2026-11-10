@@ -1,0 +1,22 @@
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -1024,6 +1024,18 @@
+ 		return -EBUSY;
+ 	}
+ 
++	/*
++	 * The compiled-in default is authoritative: userspace scripts on this
++	 * device force lz4 before setup, which would override the kernel default
++	 * (zstd). Ignore pre-setup algorithm changes so the default is kept.
++	 */
++	if (strcmp(zram->compressor, compressor)) {
++		pr_info_ratelimited("zram: comp_algorithm is locked to %s\n",
++				    zram->compressor);
++		up_write(&zram->init_lock);
++		return len;
++	}
++
+ 	strcpy(zram->compressor, compressor);
+ 	up_write(&zram->init_lock);
+ 	return len;

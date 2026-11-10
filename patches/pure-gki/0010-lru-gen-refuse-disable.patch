@@ -1,0 +1,15 @@
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -5286,6 +5286,11 @@
+ 	else if (kstrtouint(buf, 0, &caps))
+ 		return -EINVAL;
+ 
++	if (IS_ENABLED(CONFIG_LRU_GEN_ENABLED) && !(caps & BIT(LRU_GEN_CORE))) {
++		pr_info_once("lru_gen: core cannot be disabled when CONFIG_LRU_GEN_ENABLED=y\n");
++		return -EPERM;
++	}
++
+ 	for (i = 0; i < NR_LRU_GEN_CAPS; i++) {
+ 		bool enabled = caps & BIT(i);
+ 

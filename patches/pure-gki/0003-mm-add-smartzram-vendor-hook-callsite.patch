@@ -1,0 +1,22 @@
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index b91bd2134..a293496d1 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -5030,6 +5030,8 @@ static bool should_abort_scan(struct lruvec *lruvec, unsigned long seq,
+ 	return true;
+ }
+ 
++#include <trace/hooks/mm.h>
++
+ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ {
+ 	struct blk_plug plug;
+@@ -5057,6 +5059,8 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
+ 		else
+ 			swappiness = 0;
+ 
++		trace_android_vh_smartzram_tune_swappiness(&swappiness);
++
+ 		nr_to_scan = get_nr_to_scan(lruvec, sc, swappiness, &need_aging);
+ 		if (!nr_to_scan)
+ 			goto done;

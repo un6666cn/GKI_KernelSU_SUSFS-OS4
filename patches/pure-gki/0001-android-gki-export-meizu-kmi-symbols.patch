@@ -1,0 +1,55 @@
+diff --git a/drivers/android/vendor_hooks.c b/drivers/android/vendor_hooks.c
+index 7d2c67ee5..515ead64e 100644
+--- a/drivers/android/vendor_hooks.c
++++ b/drivers/android/vendor_hooks.c
+@@ -402,6 +402,8 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_cfg80211_get_context);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_save_track_hash);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_mem_cgroup_charge);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_mem_cgroup_id_remove);
++EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_extfrag_for_order);
++EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_smartzram_tune_swappiness);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_mem_cgroup_css_offline);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_mem_cgroup_css_online);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_mem_cgroup_free);
+diff --git a/include/trace/hooks/mm.h b/include/trace/hooks/mm.h
+index 1926b52aa..75c419282 100644
+--- a/include/trace/hooks/mm.h
++++ b/include/trace/hooks/mm.h
+@@ -33,6 +33,7 @@ struct address_space;
+ struct page_vma_mapped_walk;
+ struct cma;
+ struct compact_control;
++struct contig_page_info;
+ 
+ DECLARE_RESTRICTED_HOOK(android_rvh_set_skip_swapcache_flags,
+ 			TP_PROTO(gfp_t *flags),
+@@ -383,6 +384,12 @@ DECLARE_HOOK(android_vh_filemap_add_to_page_cache,
+ 	TP_PROTO(struct address_space *mapping, struct page *page,
+ 		pgoff_t offset),
+ 	TP_ARGS(mapping, page, offset));
++DECLARE_HOOK(android_vh_extfrag_for_order,
++	TP_PROTO(struct contig_page_info *info, struct zone *zone, int order),
++	TP_ARGS(info, zone, order));
++DECLARE_HOOK(android_vh_smartzram_tune_swappiness,
++	TP_PROTO(int *swappiness),
++	TP_ARGS(swappiness));
+ #endif /* _TRACE_HOOK_MM_H */
+ 
+ /* This part must be outside protection */
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 922d796aa..59251b1ea 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5197,6 +5197,12 @@ static inline void mem_cgroup_id_put(struct mem_cgroup *memcg)
+ 	mem_cgroup_id_put_many(memcg, 1);
+ }
+ 
++void mem_cgroup_id_put2(struct mem_cgroup *memcg)
++{
++	mem_cgroup_id_put(memcg);
++}
++EXPORT_SYMBOL_GPL(mem_cgroup_id_put2);
++
+ /**
+  * mem_cgroup_from_id - look up a memcg from a memcg id
+  * @id: the memcg id to look up

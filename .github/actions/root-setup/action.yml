@@ -1,0 +1,225 @@
+name: Setup pinned root implementation
+description: Clone exactly one supported root implementation at a verified commit
+inputs:
+  flavor:
+    description: "kernelsu, next, bakasu, finasu, sukisu-ultra, or kowsu"
+    required: true
+  commit:
+    description: 'Full immutable commit SHA'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Clone and integrate selected root
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel
+      run: |
+        set -euo pipefail
+
+        flavor="${{ inputs.flavor }}"
+        expected_commit="${{ inputs.commit }}"
+        case "$flavor" in
+          kernelsu)
+            repo="https://github.com/tiann/KernelSU.git"
+            directory="KernelSU"
+            manager="KernelSU Manager"
+            ;;
+          next)
+            repo="https://github.com/KernelSU-Next/KernelSU-Next.git"
+            directory="KernelSU-Next"
+            manager="KernelSU Next Manager"
+            ;;
+          bakasu)
+            repo="https://github.com/Baka-SU/BakaSU.git"
+            directory="BakaSU"
+            manager="BakaSU Manager"
+            ;;
+          sukisu-ultra)
+            repo="https://github.com/SukiSU-Ultra/SukiSU-Ultra.git"
+            directory="SukiSU-Ultra"
+            manager="SukiSU-Ultra Manager"
+            ;;
+          kowsu)
+            repo="https://github.com/KOWX712/KernelSU.git"
+            directory="KowSU"
+            manager="KowSU Manager"
+            ;;
+          finasu)
+            repo="https://github.com/LyraVoid/FinaSU.git"
+            directory="FinaSU"
+            manager="FinaSU Manager"
+            ;;
+          *)
+            echo "Unsupported root flavor: $flavor" >&2
+            exit 2
+            ;;
+        esac
+
+        if ! [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "Root commit must be a full 40-character SHA." >&2
+          exit 2
+        fi
+
+        for candidate in KernelSU KernelSU-Next BakaSU FinaSU SukiSU-Ultra KowSU; do
+          if [ "$candidate" != "$directory" ] && [ -e "$candidate" ]; then
+            echo "Refusing mixed root implementations: found $candidate." >&2
+            exit 1
+          fi
+        done
+
+        if [ -d common/drivers ]; then
+          drivers_dir="common/drivers"
+        elif [ -d drivers ]; then
+          drivers_dir="drivers"
+        else
+          echo "Kernel drivers directory not found." >&2
+          exit 1
+        fi
+
+        if [ -e "$drivers_dir/kernelsu" ] || [ -L "$drivers_dir/kernelsu" ]; then
+          echo "Refusing to replace an existing kernelsu integration." >&2
+          exit 1
+        fi
+        if [ -e "$directory" ]; then
+          echo "Refusing to reuse an existing root checkout: $directory." >&2
+          exit 1
+        fi
+
+        git clone --no-checkout "$repo" "$directory"
+        git -C "$directory" fetch --depth=1 origin "$expected_commit"
+        git -C "$directory" checkout --detach "$expected_commit"
+        actual_commit="$(git -C "$directory" rev-parse HEAD)"
+        if [ "$actual_commit" != "$expected_commit" ]; then
+          echo "Root commit mismatch: expected $expected_commit, got $actual_commit." >&2
+          exit 1
+        fi
+
+        # ---- deterministic KSU version -------------------------------------
+        # kernel/Kbuild derives KSU_VERSION from git: BASE_BRANCH comes from
+        # `rev-parse --abbrev-ref HEAD`, then it counts merge-base(HEAD,
+        # origin/<branch>). On our detached checkout `rev-parse` returns the
+        # literal "HEAD", so BASE_BRANCH stays "HEAD" and the merge-base runs
+        # against refs/remotes/origin/HEAD -- whatever branch the remote happens
+        # to default to -- instead of the branch we actually want. That makes the
+        # reported version depend on clone layout rather than on the commit, and
+        # a still-shallow clone silently counts a truncated history on top of it.
+        # Unshallow, resolve the upstream base explicitly, and pin the result.
+        if [ -f "$directory/.git/shallow" ]; then
+          git -C "$directory" fetch --unshallow --tags origin 2>/dev/null || true
+        fi
+        if [ -f "$directory/.git/shallow" ]; then
+          echo "ERROR: $directory is still a shallow clone -- KSU_VERSION would be wrong." >&2
+          exit 1
+        fi
+        case "$flavor" in
+          next)     upstream_branch="dev" ;;
+          kowsu)    upstream_branch="master" ;;
+          finasu)   upstream_branch="master" ;;
+          *)        upstream_branch="main" ;;
+        esac
+        base_commit="$(git -C "$directory" merge-base HEAD "refs/remotes/origin/${upstream_branch}" 2>/dev/null || echo "$actual_commit")"
+        ksu_count="$(git -C "$directory" rev-list --count "$base_commit")"
+        ksu_tag="$(git -C "$directory" describe --tags --abbrev=0 "$base_commit" 2>/dev/null || echo unknown)"
+        ksu_version=$((30000 + ksu_count))
+        echo "[+] KSU version: ${ksu_version} (30000 + ${ksu_count} commits at ${base_commit:0:12}, upstream ${upstream_branch})"
+        echo "ROOT_BASE_COMMIT=$base_commit" >> "$GITHUB_ENV"
+        echo "ROOT_VERSION_CODE=$ksu_version" >> "$GITHUB_ENV"
+        # Only override files that carry the git-derived heuristic; other root
+        # implementations compute their own version and are left alone.
+        kbuild="$directory/kernel/Kbuild"
+        if [ -f "$kbuild" ] && grep -q 'BASE_BRANCH' "$kbuild" && ! grep -q '^# CI: deterministic KSU_VERSION' "$kbuild"; then
+          {
+            echo ''
+            echo '# CI: deterministic KSU_VERSION (appended by .github/actions/root-setup).'
+            echo '# The git heuristic above reads rev-parse --abbrev-ref HEAD, which is'
+            echo '# "HEAD" on a detached checkout, so it counts the wrong ref.'
+            echo "KSU_VERSION := $ksu_version"
+            echo "KSU_VERSION_TAG := \"$ksu_tag\""
+          } >> "$kbuild"
+          echo "[+] pinned KSU_VERSION=${ksu_version} / tag ${ksu_tag} in $kbuild"
+        fi
+        if [ ! -f "$directory/kernel/Kconfig" ] || [ ! -f "$directory/kernel/Makefile" ]; then
+          echo "Selected root checkout does not contain a kernel integration." >&2
+          exit 1
+        fi
+        root_version="$(git -C "$directory" describe --tags --always --dirty)"
+
+        relative_kernel="$(realpath --relative-to="$drivers_dir" "$PWD/$directory/kernel")"
+        ln -s "$relative_kernel" "$drivers_dir/kernelsu"
+        grep -q 'obj-$(CONFIG_KSU) += kernelsu/' "$drivers_dir/Makefile" ||
+          printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$drivers_dir/Makefile"
+        grep -q 'source "drivers/kernelsu/Kconfig"' "$drivers_dir/Kconfig" ||
+          sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' "$drivers_dir/Kconfig"
+
+        echo "ROOT_IMPLEMENTATION=$flavor" >> "$GITHUB_ENV"
+        echo "ROOT_MANAGER=$manager" >> "$GITHUB_ENV"
+        echo "ROOT_VERSION=$root_version" >> "$GITHUB_ENV"
+        echo "ROOT_COMMIT=$actual_commit" >> "$GITHUB_ENV"
+
+    - name: Enable root configuration
+      uses: ./.github/actions/set-kernel-config
+      with:
+        config_list: |
+          CONFIG_KSU=y
+
+    - name: Soften KernelSU-Next Kbuild config guard for mrproper
+      if: inputs.flavor == 'next'
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel
+      run: |
+        # Upstream Next's drivers/kernelsu/Kbuild hard-errors at parse time
+        # when neither CONFIG_KPROBES nor CONFIG_KSU_SUSFS is set. During
+        # build.sh's mrproper phase no .config exists yet, so the clean step
+        # dies before defconfig ever sets CONFIG_KSU_SUSFS=y. Demote to a
+        # warning: the message stays visible, and the real build still gets
+        # CONFIG_KSU_SUSFS=y via defconfig. No-op if upstream drops the guard.
+        for d in common/drivers/kernelsu drivers/kernelsu; do
+          if [ -f "$d/Kbuild" ] && grep -q 'KernelSU requires either CONFIG_KPROBES' "$d/Kbuild"; then
+            sed -i 's/$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/$(warning "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/' "$d/Kbuild"
+            echo "Softened KSU config guard in $d/Kbuild"
+          fi
+        done
+
+    - name: Disable multi-manager for BakaSU
+      if: inputs.flavor == 'bakasu'
+      uses: ./.github/actions/set-kernel-config
+      with:
+        config_list: |
+          CONFIG_KSU_MULTI_MANAGER_SUPPORT=n
+          CONFIG_KSU_TOOLKIT_SUPPORT=y
+
+    - name: Soften BakaSU Kbuild submodule check for bazel builds
+      if: inputs.flavor == 'bakasu'
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel
+      run: |
+        # Fallback: demote the git submodule check from error to warning.
+        # Modify the Kbuild in the BakaSU checkout so the change propagates
+        # through the symlink into bazel sandbox.
+        for d in BakaSU/kernel; do
+          if [ -f "$d/Kbuild" ] && grep -q 'You should use \$(REPO_NAME) as a git submodule instead of copying code directly' "$d/Kbuild"; then
+            sed -i 's/\$(error You should use \$(REPO_NAME) as a git submodule instead of copying code directly)/\$(warning You should use \$(REPO_NAME) as a git submodule instead of copying code directly)/' "$d/Kbuild"
+            echo "Softened BakaSU submodule check in $d/Kbuild"
+          fi
+        done
+
+    - name: Soften BakaSU susfs_compat gate for susfs-inline builds
+      if: inputs.flavor == 'bakasu'
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel
+      run: |
+        # BakaSU's kernel/tools/susfs_compat.mk ends with an UNCONDITIONAL
+        # $(error "Please wait susfs update.") that fires on every
+        # CONFIG_KSU_SUSFS=y build (run 38221374132: the 6.1 BakaSU leg).
+        # The file's real work - the grep-based KSU_COMPAT_HAS_* defines
+        # above the gate - adapts the code to both old and new susfs
+        # layouts, so the hard stop is overcautious for our builds. Strip
+        # the tail (both $(info) lines and the $(error)), keep the shims.
+        F="BakaSU/kernel/tools/susfs_compat.mk"
+        if [ -f "$F" ] && grep -q 'Please wait susfs update' "$F"; then
+          sed -i '/susfs has NOT update with latest KernelSU source/,$d' "$F"
+          echo "Stripped susfs_compat hard stop from $F"
+        else
+          echo "No susfs_compat gate present; nothing to do"
+        fi

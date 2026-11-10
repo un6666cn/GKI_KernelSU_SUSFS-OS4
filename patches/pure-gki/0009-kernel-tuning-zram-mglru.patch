@@ -1,0 +1,20 @@
+diff --git a/arch/arm64/configs/gki_defconfig b/arch/arm64/configs/gki_defconfig
+--- a/arch/arm64/configs/gki_defconfig
++++ b/arch/arm64/configs/gki_defconfig
+@@ -127,6 +127,7 @@
+ # CONFIG_ZONE_DMA is not set
+ CONFIG_ANON_VMA_NAME=y
+ CONFIG_LRU_GEN=y
++CONFIG_LRU_GEN_ENABLED=y
+ CONFIG_MEMFD_ASHMEM_SHIM=y
+ CONFIG_DAMON=y
+ CONFIG_DAMON_PADDR=y
+@@ -310,6 +311,8 @@
+ # CONFIG_EFI_ARMSTUB_DTB_LOADER is not set
+ CONFIG_GNSS=y
+ CONFIG_ZRAM=m
++CONFIG_ZRAM_WRITEBACK=y
++CONFIG_ZRAM_DEF_COMP_ZSTD=y
+ CONFIG_BLK_DEV_LOOP=y
+ CONFIG_BLK_DEV_LOOP_MIN_COUNT=16
+ CONFIG_BLK_DEV_RAM=y

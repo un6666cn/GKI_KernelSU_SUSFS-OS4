@@ -1,0 +1,19 @@
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 60ad167ec..a84b64181 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1119,11 +1119,14 @@ static int __fragmentation_index(unsigned int order, struct contig_page_info *in
+  * It is defined as the percentage of pages found in blocks of size
+  * less than 1 << order. It returns values in range [0, 100].
+  */
++#include <trace/hooks/mm.h>
++
+ unsigned int extfrag_for_order(struct zone *zone, unsigned int order)
+ {
+ 	struct contig_page_info info;
+ 
+ 	fill_contig_page_info(zone, order, &info);
++	trace_android_vh_extfrag_for_order(&info, zone, order);
+ 	if (info.free_pages == 0)
+ 		return 0;
+ 

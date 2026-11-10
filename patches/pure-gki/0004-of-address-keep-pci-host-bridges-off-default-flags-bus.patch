@@ -1,0 +1,22 @@
+diff --git a/drivers/of/address.c b/drivers/of/address.c
+index 9454725af..ec035891e 100644
+--- a/drivers/of/address.c
++++ b/drivers/of/address.c
+@@ -344,6 +344,17 @@ static unsigned int of_bus_isa_get_flags(const __be32 *addr)
+ 
+ static int of_bus_default_flags_match(struct device_node *np)
+ {
++	/*
++	 * Some vendor DTs omit device_type = "pci" on the host bridge (Meizu
++	 * 20: qcom,pci-msm@1c00000 only has compatible), so the
++	 * "#address-cells == 3" heuristic below claims it and returns the PCI
++	 * address-space type as flags -- no IORESOURCE_MEM, every BAR "no
++	 * space", WiFi never probes.  Keep such nodes on the default bus.
++	 */
++	if (of_device_is_compatible(np, "qcom,pci-msm") ||
++	    of_node_is_type(np, "pci"))
++		return 0;
++
+ 	return of_bus_n_addr_cells(np) == 3;
+ }
+ 

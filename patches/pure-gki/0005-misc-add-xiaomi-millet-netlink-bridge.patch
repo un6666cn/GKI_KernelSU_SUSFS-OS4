@@ -1,0 +1,2108 @@
+diff --git a/arch/arm64/configs/gki_defconfig b/arch/arm64/configs/gki_defconfig
+index 518fa2583..fc5942199 100644
+--- a/arch/arm64/configs/gki_defconfig
++++ b/arch/arm64/configs/gki_defconfig
+@@ -718,3 +718,4 @@ CONFIG_HIST_TRIGGERS=y
+ CONFIG_PID_IN_CONTEXTIDR=y
+ CONFIG_FUNCTION_ERROR_INJECTION=y
+ # CONFIG_RUNTIME_TESTING_MENU is not set
++CONFIG_XIAOMI_MILLET=y
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index c0967589f..a2d1fe492 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -507,4 +507,5 @@ source "drivers/misc/cardreader/Kconfig"
+ source "drivers/misc/habanalabs/Kconfig"
+ source "drivers/misc/uacce/Kconfig"
+ source "drivers/misc/pvpanic/Kconfig"
++source "drivers/misc/xiaomi/millet/Kconfig"
+ endmenu
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index a109b9cb6..dddd6b90e 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -61,3 +61,4 @@ obj-$(CONFIG_HISI_HIKEY_USB)	+= hisi_hikey_usb.o
+ obj-$(CONFIG_HI6421V600_IRQ)	+= hi6421v600-irq.o
+ obj-$(CONFIG_UID_SYS_STATS)	+= uid_sys_stats.o
+ obj-$(CONFIG_OPEN_DICE)		+= open-dice.o
++obj-$(CONFIG_XIAOMI_MILLET)	+= xiaomi/millet/
+diff --git a/drivers/misc/xiaomi/millet/Kconfig b/drivers/misc/xiaomi/millet/Kconfig
+new file mode 100755
+index 000000000..6dce7c7b7
+--- /dev/null
++++ b/drivers/misc/xiaomi/millet/Kconfig
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++config XIAOMI_MILLET
++	bool "Xiaomi Millet netlink bridge"
++	depends on NET && ANDROID_BINDER_IPC
++	default n
++	help
++	  Xiaomi Millet transport (netlink family 31) used by the
++	  millet_monitor userspace daemon for application freeze and
++	  binder state reporting.
+diff --git a/drivers/misc/xiaomi/millet/Makefile b/drivers/misc/xiaomi/millet/Makefile
+new file mode 100755
+index 000000000..3c58d80c3
+--- /dev/null
++++ b/drivers/misc/xiaomi/millet/Makefile
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: GPL-2.0
++
++ccflags-y += -I$(srctree)
++
++obj-$(CONFIG_XIAOMI_MILLET) += millet_core.o
++obj-$(CONFIG_XIAOMI_MILLET) += millet_hs.o
++obj-$(CONFIG_XIAOMI_MILLET) += millet_sig.o
++obj-$(CONFIG_XIAOMI_MILLET) += millet_pkg.o
++obj-$(CONFIG_XIAOMI_MILLET) += binder_gki.o
++obj-$(CONFIG_XIAOMI_MILLET) += millet_binder.o
+diff --git a/drivers/misc/xiaomi/millet/binder_gki.c b/drivers/misc/xiaomi/millet/binder_gki.c
+new file mode 100755
+index 000000000..da3822bc0
+--- /dev/null
++++ b/drivers/misc/xiaomi/millet/binder_gki.c
+@@ -0,0 +1,500 @@
++/*
++ * Copyright (c) Xiaomi Technologies Co., Ltd. 2020. All rights reserved.
++ *
++ * File name: oem_binder.c
++ * Description: millet-binder-driver
++ * Author: guchao1@xiaomi.com
++ * Version: 1.0
++ * Date:  2020/9/9
++ */
++#define pr_fmt(fmt) "millet-binder_gki: " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/freezer.h>
++#include <linux/ktime.h>
++#include <linux/hrtimer.h>
++#include <linux/proc_fs.h>
++#include "millet.h"
++#include "binder_oem.h"
++#include <trace/hooks/binder.h>
++#include <drivers/android/binder_internal.h>
++
++static struct hlist_head *get_binder_hhead = NULL;
++static struct mutex *get_binder_lock = NULL;
++static bool bgot = false;
++extern unsigned int millet_debug;
++extern bool millet_binder_switch;
++
++struct oem_binder_hook oem_binder_hook_set = {
++	.oem_wahead_thresh = 0,
++	.oem_wahead_space = 0,
++	.oem_reply_hook = NULL,
++	.oem_trans_hook = NULL,
++	.oem_wait4_hook = NULL,
++	.oem_query_st_hook = NULL,
++	.oem_buf_overflow_hook = NULL,
++};
++
++static bool binder_worklist_empty_ilocked(struct list_head *list)
++{
++	return list_empty(list);
++}
++
++static enum BINDER_STAT query_binder_stat(struct binder_proc *proc)
++{
++	struct rb_node *n;
++	struct binder_thread *thread;
++	struct binder_transaction *t;
++
++	if (!oem_binder_hook_set.oem_query_st_hook)
++		return BINDER_IN_IDLE;
++
++	if (!proc->tsk)
++		return BINDER_IN_IDLE;
++
++	spin_lock(&proc->inner_lock);
++
++	if (proc->tsk && !binder_worklist_empty_ilocked(&proc->todo)) {
++		spin_unlock(&proc->inner_lock);
++		return BINDER_PROC_IN_BUSY;
++	}
++
++	for (n = rb_first(&proc->threads); n != NULL; n = rb_next(n)) {
++		thread = rb_entry(n, struct binder_thread, rb_node);
++		if (!thread->task)
++			continue;
++
++		if (!binder_worklist_empty_ilocked(&thread->todo)) {
++			spin_unlock(&proc->inner_lock);
++			return BINDER_THREAD_IN_BUSY;
++		}
++
++		t = thread->transaction_stack;
++		if (!t)
++			continue;
++
++		spin_lock(&t->lock);
++		if (t->to_thread == thread) {
++			spin_unlock(&t->lock);
++			spin_unlock(&proc->inner_lock);
++			return BINDER_IN_TRANSACTION;
++		}
++		spin_unlock(&t->lock);
++	}
++
++	spin_unlock(&proc->inner_lock);
++	return BINDER_IN_IDLE;
++}
++
++static enum BINDER_STAT query_binder_stat_frozen(struct binder_proc *proc)
++{
++	struct list_head *w;
++	struct rb_node *n;
++	struct binder_thread *thread;
++	struct binder_transaction *t;
++	int pid;
++	int need_reply;
++
++	if (!oem_binder_hook_set.oem_query_st_hook)
++		return BINDER_IN_IDLE;
++
++	if (!proc->tsk)
++		return BINDER_IN_IDLE;
++
++	spin_lock(&proc->inner_lock);
++
++	if (proc->tsk && !binder_worklist_empty_ilocked(&proc->todo)) {
++		int caller_uid;
++
++		caller_uid = task_uid(proc->tsk).val;
++		need_reply = -1;
++
++		for (w = proc->todo.next; w != &proc->todo; w = w->next) {
++			if (!w)
++				continue;
++
++			if (container_of(w, struct binder_work, entry)->type != BINDER_WORK_TRANSACTION)
++				continue;
++
++			t = container_of(w, struct binder_transaction, work.entry);
++			spin_lock(&t->lock);
++			if (!t) {
++				spin_unlock(&t->lock);
++				continue;
++			}
++
++			if (t->to_thread) {
++				spin_unlock(&t->lock);
++				continue;
++			}
++
++			if (t->from && t->from->proc && t->from->proc->tsk)
++				pid = t->from->proc->tsk->tgid;
++			else
++				pid = -1;
++
++			need_reply = t->need_reply;
++			spin_unlock(&t->lock);
++			printk(KERN_ERR "millet_debug:procTodo calleruid:%d callerPid:%d targetUid:%d targetPid:%d Frozen_Trans_Proc need_reply:%d",
++				t->sender_euid.val, pid, -1, -1, need_reply);
++
++			if (need_reply == 1) {
++				spin_unlock(&proc->inner_lock);
++				return BINDER_PROC_IN_BUSY;
++			}
++		}
++	}
++
++	need_reply = -1;
++	for (n = rb_first(&proc->threads); n != NULL; n = rb_next(n)) {
++		thread = rb_entry(n, struct binder_thread, rb_node);
++		if (!thread->task)
++			continue;
++
++		for (w = thread->todo.next; w != &thread->todo; w = w->next) {
++			int target_uid, target_pid;
++
++			if (!w)
++				continue;
++
++			if (container_of(w, struct binder_work, entry)->type != BINDER_WORK_TRANSACTION)
++				continue;
++
++			t = container_of(w, struct binder_transaction, work.entry);
++			spin_lock(&t->lock);
++			if (!t) {
++				spin_unlock(&t->lock);
++				continue;
++			}
++
++			if (t->to_thread != thread) {
++				spin_unlock(&t->lock);
++				continue;
++			}
++
++			if (t->from && t->from->proc && t->from->proc->tsk)
++				pid = t->from->proc->tsk->tgid;
++			else
++				pid = -1;
++
++			need_reply = t->need_reply;
++			if (thread) {
++				target_pid = thread->proc->pid;
++				target_uid = task_uid(t->to_thread->task).val;
++			} else {
++				target_uid = -1;
++				target_pid = -1;
++			}
++			spin_unlock(&t->lock);
++			printk(KERN_ERR "millet_debug:threadTodo calleruid:%d callerPid:%d targetUid:%d targetPid:%d  Frozen_Trans_thread need_reply:%d",
++				t->sender_euid.val, pid, target_uid, target_pid, need_reply);
++
++			if (need_reply == 1) {
++				spin_unlock(&proc->inner_lock);
++				return BINDER_THREAD_IN_BUSY;
++			}
++		}
++
++		t = thread->transaction_stack;
++		if (!t)
++			continue;
++
++		spin_lock(&t->lock);
++		if (t->to_thread != thread) {
++			spin_unlock(&thread->transaction_stack->lock);
++			continue;
++		}
++
++		pid = -1;
++		if (t->from && t->from->proc && t->from->proc->tsk)
++			pid = t->from->proc->tsk->tgid;
++
++		need_reply = t->need_reply;
++		if (t->to_thread) {
++			int target_uid, target_pid;
++
++			target_pid = t->to_thread->proc->pid;
++			target_uid = task_uid(t->to_thread->task).val;
++			printk(KERN_ERR "millet_debug:taskTodo calleruid:%d callerPid:%d targetUid:%d targetPid:%d Frozen_Trans_stack need_reply:%d",
++				t->sender_euid.val, pid, target_uid, target_pid, need_reply);
++			spin_unlock(&thread->transaction_stack->lock);
++			if (need_reply) {
++				spin_unlock(&proc->inner_lock);
++				return BINDER_IN_TRANSACTION;
++			}
++		}
++	}
++
++	spin_unlock(&proc->inner_lock);
++	return BINDER_IN_IDLE;
++}
++
++void query_binder_app_stat(int uid)
++{
++	struct binder_proc *proc;
++	bool idle_f = true;
++	enum BINDER_STAT stat;
++
++	if (!oem_binder_hook_set.oem_query_st_hook ||
++		!get_binder_lock ||!get_binder_hhead)
++		return;
++	mutex_lock(get_binder_lock);
++	hlist_for_each_entry(proc, get_binder_hhead, proc_node) {
++		enum BINDER_STAT busy;
++
++		if (!proc->tsk)
++			continue;
++
++		if (task_uid(proc->tsk).val != uid)
++			continue;
++
++		if (millet_binder_switch)
++			busy = query_binder_stat_frozen(proc);
++		else
++			busy = query_binder_stat(proc);
++
++		if (busy != BINDER_IN_IDLE)
++			idle_f = false;
++	}
++
++	if (idle_f)
++		stat = BINDER_IN_IDLE;
++	else
++		stat = BINDER_IN_BUSY;
++
++	oem_binder_hook_set.oem_query_st_hook(uid, current, 0, current->pid, stat);
++	mutex_unlock(get_binder_lock);
++}
++EXPORT_SYMBOL_GPL(query_binder_app_stat);
++
++
++struct task_struct *binder_buff_owner(size_t *free_async_space)
++{
++	struct binder_proc *proc = NULL;
++	if (!free_async_space)
++		return NULL;
++
++	proc = container_of(free_async_space, struct binder_proc, alloc.free_async_space);
++	return proc->tsk;
++}
++
++static size_t binder_alloc_buffer_size(struct binder_alloc *alloc,
++				       struct binder_buffer *buffer)
++{
++	if (list_is_last(&buffer->entry, &alloc->buffers))
++		return alloc->buffer + alloc->buffer_size - buffer->user_data + sizeof(*buffer);
++
++	return list_next_entry(buffer, entry)->user_data - buffer->user_data + sizeof(*buffer);
++}
++
++void mi_check_buffer_size_locked(size_t size, size_t *free_async_space, int is_async)
++{
++	struct binder_alloc *alloc;
++	struct rb_node *n;
++	size_t total[2], async[2];
++
++	if (!is_async)
++		return;
++
++	alloc = container_of(free_async_space, struct binder_alloc, free_async_space);
++	if (!alloc)
++		return;
++
++	if (size + SZ_64K >= *free_async_space) {
++		pr_info("MIUI async transaction from %5d:%5d to %5d:0 apply:%zd free:%zd, may fail!\n",
++			current->tgid, current->pid, alloc->pid, size, *free_async_space);
++		pr_info("MIUI large buffers(>32K):\n");
++
++		for (n = rb_first(&alloc->allocated_buffers); n != NULL; n = rb_next(n)) {
++			struct binder_buffer *buffer;
++			struct binder_transaction *t;
++			size_t buffer_size;
++
++			buffer = rb_entry(n, struct binder_buffer, rb_node);
++			if (!buffer)
++				continue;
++
++			buffer_size = binder_alloc_buffer_size(alloc, buffer);
++			total[0]++;
++			if (buffer->async_transaction) {
++				async[0]++;
++				async[1] += buffer_size;
++			}
++			total[1] += buffer_size;
++
++			if (buffer_size >= SZ_32K) {
++				int to_pid;
++				int to_tid;
++				int from_pid;
++				int from_tid;
++				char *desc;
++
++				t = buffer->transaction;
++				if (!t)
++					continue;
++
++				spin_lock(&t->lock);
++				to_pid = t->to_proc ? t->to_proc->pid : 0;
++				to_tid = t->to_thread ? t->to_thread->pid : 0;
++				from_pid = (t->from && t->from->proc) ?
++					t->from->proc->pid : -1;
++				from_tid = t->from ? t->from->pid : -1;
++				desc = buffer->async_transaction ? "async" :
++					(t->from ? "call" : "reply");
++
++				pr_info("MIUI pending %s transaction from %5d:%5d to %5d:%5d node:%d code:%x size:%zd\n",
++					desc, from_pid, from_tid, to_pid, to_tid,
++					buffer->target_node ? buffer->target_node->debug_id : 0,
++					t->code, buffer_size);
++				spin_unlock(&t->lock);
++			}
++		}
++
++		if (total[0] || async[0])
++			pr_info("MIUI total num:%zd total async num:%zd,total size:%zd total async size:%zd\n",
++				total[0], async[0], total[1], async[1]);
++	}
++}
++
++void mi_binder_alloc_new_buf_locked(void *data, size_t size, size_t *free_async_space,
++		int is_async)
++{
++	mi_check_buffer_size_locked(size, free_async_space, is_async);
++
++	if (is_async && oem_binder_hook_set.oem_buf_overflow_hook
++		&& ((*free_async_space < oem_binder_hook_set.oem_wahead_thresh
++		* (size + sizeof(struct binder_buffer)))
++		|| (*free_async_space < oem_binder_hook_set.oem_wahead_space))) {
++			struct task_struct *owner;
++			owner = binder_buff_owner(free_async_space);
++
++			if (owner)
++				oem_binder_hook_set.oem_buf_overflow_hook(owner, current,
++						current->pid, false, 0);
++	}
++}
++
++void mi_binder_replay(void *data, struct binder_proc *target_proc, struct binder_proc *proc,
++	struct binder_thread *thread, struct binder_transaction_data *tr)
++{
++	if (oem_binder_hook_set.oem_reply_hook && target_proc->tsk)
++		oem_binder_hook_set.oem_reply_hook(target_proc->tsk, proc->tsk,
++				thread->pid, tr->flags & TF_ONE_WAY,
++				tr->code);
++}
++
++void mi_binder_transaction(void *data, struct binder_proc *target_proc, struct binder_proc *proc,
++	struct binder_thread *thread, struct binder_transaction_data *tr)
++{
++	if (target_proc && oem_binder_hook_set.oem_trans_hook && target_proc->tsk)
++		oem_binder_hook_set.oem_trans_hook(target_proc->tsk, proc->tsk,
++				thread->pid, tr->flags & TF_ONE_WAY,
++				tr->code);
++
++	if (millet_debug) {
++		char desc[140];
++		char buf[140];
++		char *src = buf + 16;
++		size_t len;
++		int j;
++
++		if (!target_proc)
++			return;
++
++		if (!(tr->flags & TF_ONE_WAY))
++			return;
++
++		if (task_uid(target_proc->tsk).val <= UID_MIN_VALUE)
++			return;
++
++		if (!frozen_task_group(target_proc->tsk))
++			return;
++
++		len = min(tr->data_size, sizeof(buf));
++		if (copy_from_user(buf, (void __user *)(unsigned long)tr->data.ptr.buffer, len))
++			return;
++
++		for (j = 0; src[2 * j] && j < 140 && 2 * j + 17 < len; j++)
++			desc[j] = src[2 * j];
++		if (j == 140)
++			desc[139] = '\0';
++
++		printk(KERN_ERR "millet_kernel calleruid:%d callerPid:%d targetUid:%d targetPid:%d  code:%d  desc:%s",
++			task_uid(proc->tsk).val, task_tgid_nr(proc->tsk),
++			task_uid(target_proc->tsk).val, task_tgid_nr(target_proc->tsk),
++			tr->code, desc);
++	}
++}
++
++void mi_binder_wait_for_work(void *data, bool do_proc_work, struct binder_thread *thread,
++	struct binder_proc *proc)
++{
++	struct task_struct *dst;
++
++	if(!thread->transaction_stack)
++		return;
++
++	spin_lock(&thread->transaction_stack->lock);
++	if (oem_binder_hook_set.oem_wait4_hook
++			&& !thread->is_dead
++			&& thread->transaction_stack
++			&& thread->transaction_stack->to_proc
++			&& thread->transaction_stack->to_proc->tsk){
++		dst = thread->transaction_stack->to_proc->tsk;
++		get_task_struct(dst);
++		spin_unlock(&thread->transaction_stack->lock);
++	}else{
++		spin_unlock(&thread->transaction_stack->lock);
++		return;
++	}
++	oem_binder_hook_set.oem_wait4_hook(dst,
++				proc->tsk,
++				thread->pid,
++				thread->transaction_stack->flags & TF_ONE_WAY,
++				thread->transaction_stack->code);
++	put_task_struct(dst);
++}
++
++void mi_get_hhead_and_lock(void *data, struct hlist_head *hhead, struct mutex *lock)
++{
++	if (!bgot) {
++		if (hhead)
++			get_binder_hhead = hhead;
++		if (lock)
++			get_binder_lock = lock;
++		bgot = true;
++	}
++}
++
++void oem_register_binder_hook(struct oem_binder_hook *set)
++{
++	if (!set)
++		return;
++
++	oem_binder_hook_set.oem_wahead_thresh = set->oem_wahead_thresh;
++	oem_binder_hook_set.oem_wahead_space = set->oem_wahead_space;
++	oem_binder_hook_set.oem_reply_hook = set->oem_reply_hook;
++	oem_binder_hook_set.oem_trans_hook = set->oem_trans_hook;
++	oem_binder_hook_set.oem_wait4_hook = set->oem_wait4_hook;
++	oem_binder_hook_set.oem_query_st_hook = set->oem_query_st_hook;
++	oem_binder_hook_set.oem_buf_overflow_hook = set->oem_buf_overflow_hook;
++}
++EXPORT_SYMBOL_GPL(oem_register_binder_hook);
++
++
++static int __init init_binder_gki(void)
++{
++	pr_err("enter init_binder_gki func!\n");
++	register_trace_android_vh_binder_alloc_new_buf_locked(mi_binder_alloc_new_buf_locked, NULL);
++	register_trace_android_vh_binder_reply(mi_binder_replay, NULL);
++	register_trace_android_vh_binder_trans(mi_binder_transaction, NULL);
++	register_trace_android_vh_binder_wait_for_work(mi_binder_wait_for_work, NULL);
++	register_trace_android_vh_binder_preset(mi_get_hhead_and_lock, NULL);
++
++	return 0;
++}
++
++late_initcall(init_binder_gki);
++
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/xiaomi/millet/binder_oem.h b/drivers/misc/xiaomi/millet/binder_oem.h
+new file mode 100755
+index 000000000..57e7888e7
+--- /dev/null
++++ b/drivers/misc/xiaomi/millet/binder_oem.h
+@@ -0,0 +1,20 @@
++#ifndef BINDER_OEM_H
++#define BINDER_OEM_H
++#include <linux/sched.h>
++
++typedef void (*type_binder_send_hook)(struct task_struct *dst, struct task_struct *src,
++		int caller_tid, bool oneway, int code);
++typedef void (*type_binder_query_hook)(int uid, struct task_struct *tsk, int tid, int pid,
++		enum BINDER_STAT reason);
++
++struct oem_binder_hook {
++	unsigned long oem_wahead_thresh;
++	unsigned long oem_wahead_space;
++
++	type_binder_send_hook oem_buf_overflow_hook;
++	type_binder_send_hook oem_reply_hook;
++	type_binder_send_hook oem_trans_hook;
++	type_binder_send_hook oem_wait4_hook;
++	type_binder_query_hook oem_query_st_hook;
++};
++#endif
+diff --git a/drivers/misc/xiaomi/millet/millet.h b/drivers/misc/xiaomi/millet/millet.h
+new file mode 100755
+index 000000000..1cc498cbd
+--- /dev/null
++++ b/drivers/misc/xiaomi/millet/millet.h
+@@ -0,0 +1,64 @@
++#ifndef MILLET_H
++#define MILLET_H
++
++#include <linux/freezer.h>
++#include <net/sock.h>
++#include <linux/proc_fs.h>
++#include <linux/sched.h>
++#include "uapi/millet.h"
++#include <linux/cgroup.h>
++
++#define RET_OK 0
++#define RET_ERR -1
++#define WARN_AHEAD_MSGS		3
++#define RESERVE_ORDER		17
++#define WARN_AHEAD_SPACE	(1 << RESERVE_ORDER)
++
++struct millet_sock;
++typedef void (*recv_hook)(void *data, unsigned int len);
++typedef int (*send_hook)(struct task_struct *tsk,
++		struct millet_data *data, struct millet_sock *sk);
++typedef void (*init_hook)(struct millet_sock *sk);
++
++struct millet_sock {
++	struct sock *sock;
++
++	struct mod_info {
++		int id;
++		enum MILLET_TYPE monitor;
++		atomic_t port;
++		atomic_t loop_init;
++		recv_hook recv_from;
++		send_hook send_to;
++		init_hook init;
++		spinlock_t lock;
++		struct {
++			u64 send_suc;
++			u64 send_fail;
++			u64 runtime;
++		} stat;
++		char name[NAME_MAXLEN];
++		void *priv;
++		atomic_t has_init;
++	} mod[MILLET_TYPES_NUM];
++};
++
++static inline bool cgroup_task_freeze(struct task_struct *task)
++{
++	bool ret;
++
++	if (task->flags & PF_KTHREAD)
++		return false;
++
++	rcu_read_lock();
++	ret = test_bit(CGRP_FREEZE, &task_dfl_cgroup(task)->flags);
++	rcu_read_unlock();
++
++	return ret;
++}
++
++static inline int frozen_task_group(struct task_struct *task)
++{
++	return (freezing(task) || frozen(task) || cgroup_task_freeze(task) || cgroup_task_frozen(task));
++}
++#endif
+diff --git a/drivers/misc/xiaomi/millet/millet_binder.c b/drivers/misc/xiaomi/millet/millet_binder.c
+new file mode 100755
+index 000000000..9f405b29f
+--- /dev/null
++++ b/drivers/misc/xiaomi/millet/millet_binder.c
+@@ -0,0 +1,258 @@
++/*
++ * Copyright (c) Xiaomi Technologies Co., Ltd. 2020. All rights reserved.
++ *
++ * File name: oem_binder.c
++ * Description: millet-binder-driver
++ * Author: guchao1@xiaomi.com
++ * Version: 1.0
++ * Date:  2020/9/9
++ */
++#define pr_fmt(fmt) "millet_millet-binder: " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/freezer.h>
++#include <linux/ktime.h>
++#include <linux/hrtimer.h>
++#include <linux/proc_fs.h>
++#include "millet.h"
++#include "binder_oem.h"
++
++
++extern int millet_sendmsg(enum MILLET_TYPE type, struct task_struct *t,
++		struct millet_data *data);
++extern int millet_sendto_user(struct task_struct *tsk,
++		struct millet_data *data, struct millet_sock *sk);
++extern int register_millet_hook(int type, recv_hook recv_from, send_hook send_to,
++		init_hook init);
++extern int init_millet_subsystem(int type);
++extern int frozen_uid_min;
++extern void query_binder_app_stat(int uid);
++extern void oem_register_binder_hook(struct oem_binder_hook *set);
++
++static void
++__binder_sendto(struct millet_data *data, struct task_struct *dst,
++		struct task_struct *src, int caller_tid, bool oneway, int code);
++
++static void
++mi_binder_reply_hook(struct task_struct *dst, struct task_struct *src,
++		int caller_tid, bool oneway, int code)
++{
++	if (unlikely(!dst))
++		return;
++
++	get_task_struct(dst);
++	if (task_uid(dst).val > frozen_uid_min) {
++		put_task_struct(dst);
++		return;
++	}
++	{
++		struct millet_data data;
++
++		memset(&data, 0, sizeof(data));
++		data.pri[0] =  BINDER_REPLY;
++
++		get_task_struct(src);
++		__binder_sendto(&data, dst, src, caller_tid, oneway, code);
++		put_task_struct(src);
++	}
++	put_task_struct(dst);
++}
++
++static void
++mi_binder_trans_hook(struct task_struct *dst, struct task_struct *src,
++		int caller_tid, bool oneway, int code)
++{
++	if (unlikely(!dst))
++		return;
++
++	get_task_struct(dst);
++	if (task_uid(dst).val <= frozen_uid_min || dst->pid == src->pid) {
++		put_task_struct(dst);
++		return;
++	}
++	{
++		struct millet_data data;
++
++		memset(&data, 0, sizeof(data));
++		data.pri[0] =  BINDER_TRANS;
++
++		get_task_struct(src);
++		__binder_sendto(&data, dst, src, caller_tid, oneway, code);
++		put_task_struct(src);
++	}
++	put_task_struct(dst);
++}
++
++static void
++mi_binder_wait4_hook(struct task_struct *dst, struct task_struct *src,
++			int caller_tid, bool oneway, int code)
++{
++	if (unlikely(!dst))
++		return;
++
++	get_task_struct(dst);
++	if (task_uid(dst).val > frozen_uid_min || dst->pid == src->pid) {
++		put_task_struct(dst);
++		return;
++	}
++	{
++		struct millet_data data;
++
++		memset(&data, 0, sizeof(data));
++		data.pri[0] =  BINDER_THREAD_HAS_WORK;
++
++		get_task_struct(src);
++		__binder_sendto(&data, dst, src, caller_tid, oneway, code);
++		put_task_struct(src);
++	}
++	put_task_struct(dst);
++}
++
++static void
++mi_binder_overflow_hook(struct task_struct *dst, struct task_struct *src,
++		int caller_tid, bool oneway, int code)
++{
++	if (unlikely(!dst))
++		return;
++
++	get_task_struct(dst);
++	{
++		struct millet_data data;
++
++		memset(&data, 0, sizeof(data));
++		data.pri[0] =  BINDER_BUFF_WARN;
++		get_task_struct(src);
++		__binder_sendto(&data, dst, src, caller_tid, oneway, code);
++		put_task_struct(src);
++	}
++	put_task_struct(dst);
++}
++
++
++static void
++__binder_sendto(struct millet_data *data, struct task_struct *dst,
++		struct task_struct *src, int caller_tid, bool oneway, int code)
++{
++	data->mod.k_priv.binder.trans.src_task = src;
++	data->mod.k_priv.binder.trans.caller_tid = caller_tid;
++	data->mod.k_priv.binder.trans.dst_task = dst;
++	data->mod.k_priv.binder.trans.tf_oneway = oneway;
++	data->mod.k_priv.binder.trans.code = code;
++	millet_sendmsg(BINDER_TYPE, dst, data);
++}
++
++static void
++mi_query_binder_st_hook(int uid, struct task_struct *tsk, int tid, int pid,
++		enum BINDER_STAT reason)
++{
++	struct millet_data data;
++
++	memset(&data, 0, sizeof(data));
++	data.uid = uid;
++	data.mod.k_priv.binder.stat.task = tsk;
++	data.mod.k_priv.binder.stat.tid = tid;
++	data.mod.k_priv.binder.stat.pid = pid;
++	data.mod.k_priv.binder.stat.reason = reason;
++	millet_sendmsg(BINDER_ST_TYPE, tsk, &data);
++}
++
++static int binder_sendmsg(struct task_struct *tsk,
++		struct millet_data *data, struct millet_sock *sk)
++{
++	int ret = 0;
++	struct task_struct *src_task;
++	struct task_struct *dst_task;
++
++	if (!sk || !data || !tsk) {
++		pr_err("%s input invalid\n", __FUNCTION__);
++		return RET_ERR;
++	}
++
++	data->msg_type = MSG_TO_USER;
++	data->owner = BINDER_TYPE;
++	src_task = (struct task_struct *)data->mod.k_priv.binder.trans.src_task;
++	data->mod.k_priv.binder.trans.caller_pid = task_pid_nr(src_task);
++	data->mod.k_priv.binder.trans.caller_uid = task_uid(src_task).val;
++	dst_task = (struct task_struct *)data->mod.k_priv.binder.trans.dst_task;
++	data->mod.k_priv.binder.trans.dst_pid = task_pid_nr(dst_task);
++	data->uid = task_uid(dst_task).val;
++
++	if (frozen_task_group(tsk))
++		ret = millet_sendto_user(tsk, data, sk);
++
++	return ret;
++}
++
++static void binder_init_millet(struct millet_sock *sk)
++{
++	if (sk) {
++		sk->mod[BINDER_TYPE].monitor = BINDER_TYPE;
++		atomic_set(&sk->mod[BINDER_TYPE].has_init, 1);
++	}
++}
++
++static int binder_st_sendmsg(struct task_struct *tsk,
++		struct millet_data *data, struct millet_sock *sk)
++
++{
++	int ret = RET_OK;
++
++	if (!sk || !data || !tsk) {
++		pr_err("%s input invalid\n", __FUNCTION__);
++		return RET_ERR;
++	}
++
++	data->msg_type = MSG_TO_USER;
++	data->owner = BINDER_ST_TYPE;
++	ret = millet_sendto_user(tsk, data, sk);
++
++	return ret;
++}
++
++static void binder_st_init_millet(struct millet_sock *sk)
++{
++	if (sk) {
++		sk->mod[BINDER_ST_TYPE].monitor = BINDER_TYPE;
++		atomic_set(&sk->mod[BINDER_ST_TYPE].has_init, 1);
++	}
++}
++
++static void binder_recv_hook(void *data, unsigned int len)
++{
++	struct millet_userconf *payload = (struct millet_userconf *)data;
++
++	query_binder_app_stat(payload->mod.u_priv.binder_st.uid);
++}
++
++static void get_oem_binder_hook(struct oem_binder_hook *set)
++{
++	set->oem_wahead_thresh = WARN_AHEAD_MSGS;
++	set->oem_wahead_space = WARN_AHEAD_SPACE;
++	set->oem_reply_hook = mi_binder_reply_hook;
++	set->oem_trans_hook = mi_binder_trans_hook;
++	set->oem_wait4_hook = mi_binder_wait4_hook;
++	set->oem_query_st_hook = mi_query_binder_st_hook;
++	set->oem_buf_overflow_hook = mi_binder_overflow_hook;
++}
++
++static int __init init_millet_binder_drv(void)
++{
++	struct oem_binder_hook oem_set;
++
++	pr_err("enter init_millet_binder_drv func!\n");
++	get_oem_binder_hook(&oem_set);
++	oem_register_binder_hook(&oem_set);
++	register_millet_hook(BINDER_TYPE, NULL,
++			binder_sendmsg, binder_init_millet);
++	init_millet_subsystem(BINDER_TYPE);
++	register_millet_hook(BINDER_ST_TYPE, binder_recv_hook,
++			binder_st_sendmsg, binder_st_init_millet);
++	init_millet_subsystem(BINDER_ST_TYPE);
++
++	return 0;
++}
++
++late_initcall(init_millet_binder_drv);
++
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/xiaomi/millet/millet_core.c b/drivers/misc/xiaomi/millet/millet_core.c
+new file mode 100755
+index 000000000..212a420d0
+--- /dev/null
++++ b/drivers/misc/xiaomi/millet/millet_core.c
+@@ -0,0 +1,505 @@
++/*
++ * Copyright (c) Xiaomi Technologies Co., Ltd. 2019. All rights reserved.
++ *
++ * File name: millet.c
++ * Description: smart frozen control
++ * Author: guchao1@xiaomi.com
++ * Version: 1.0
++ * Date:  2019/11/27
++ */
++
++#define pr_fmt(fmt) "millet_millet-core: " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/netlink.h>
++#include <linux/skbuff.h>
++#include <linux/freezer.h>
++#include <net/sock.h>
++#include <linux/ktime.h>
++#include <linux/hrtimer.h>
++#include <linux/proc_fs.h>
++#include "millet.h"
++
++int frozen_uid_min = 10000;
++EXPORT_SYMBOL_GPL(frozen_uid_min);
++unsigned long binder_warn_ahead_space = WARN_AHEAD_SPACE;
++EXPORT_SYMBOL_GPL(binder_warn_ahead_space);
++unsigned int millet_debug;
++EXPORT_SYMBOL_GPL(millet_debug);
++bool millet_binder_switch = true;
++EXPORT_SYMBOL_GPL(millet_binder_switch);
++static struct millet_sock millet_sk;
++struct proc_dir_entry *millet_rootdir;
++static int millet_freeze_switch;
++module_param(millet_debug, uint, 0644);
++module_param(frozen_uid_min, int, 0644);
++module_param(binder_warn_ahead_space, ulong, 0644);
++module_param(millet_freeze_switch, int, 0660);
++module_param(millet_binder_switch, bool, 0644);
++enum MILLET_VERSION millet_v= VERSION_1_0;
++
++static void dump_send_msg(struct millet_data *msg)
++{
++	if (!millet_debug)
++		return;
++
++	pr_info("-----up-report msg-head dump-----\n");
++	if (!msg) {
++		pr_err("msg is NULL");
++		return;
++	}
++
++	pr_info("up msg: %d\n", msg->msg_type);
++	pr_info("up type: %d\n", msg->owner);
++	pr_info("up src_port: 0x%lx\n", msg->src_port);
++	pr_info("up dest_port: 0x%lx\n", msg->dst_port);
++	pr_info("up uid: %d\n", msg->uid);
++}
++
++static void dump_recv_msg(struct millet_userconf *msg)
++{
++	if (!millet_debug)
++		return;
++
++	pr_info("-----recv msg from user-----\n");
++	if (!msg) {
++		pr_err("msg is NULL");
++		return;
++	}
++
++	pr_info("msg: %d\n", msg->msg_type);
++	pr_info("type: %d\n", msg->owner);
++	pr_info("src_port: 0x%lx\n", msg->src_port);
++	pr_info("dest_port: 0x%lx\n", msg->dst_port);
++}
++
++bool judge_millet_freeze_switch(void)
++{
++	return 1 == millet_freeze_switch;
++}
++
++
++int millet_sendto_user(struct task_struct *tsk,
++		struct millet_data *data, struct millet_sock *sk)
++{
++	int ret, msg_len = 0;
++	int monitor, monitor_port = 0;
++	struct sk_buff *skb = NULL;
++	struct nlmsghdr *nlh = NULL;
++	struct millet_data *payload = NULL;
++	struct timespec64 ts;
++
++	if (!data || !MSG_VALID(data->msg_type)) {
++		pr_err("%s:msg or  msg type is invalid! %d\n",
++		       __func__, data->msg_type);
++		return RET_ERR;
++	}
++
++	msg_len = sizeof(struct millet_data);
++	skb = nlmsg_new(msg_len, GFP_ATOMIC);
++	if (!skb) {
++		pr_err("%s alloc_skb failed! %d\n",
++		       __func__, data->owner);
++		return RET_ERR;
++	}
++
++	nlh = nlmsg_put(skb, 0, 0, 0, msg_len, 0);
++	if (!nlh) {
++		kfree_skb(skb);
++		return RET_ERR;
++	}
++
++	payload = nlmsg_data(nlh);
++	memset(payload, 0, msg_len);
++	memcpy(payload, data, msg_len);
++	payload->src_port = MILLET_KERNEL_ID;
++	payload->dst_port = MILLET_USER_ID;
++	monitor = sk->mod[payload->owner].monitor;
++	if (!TYPE_VALID(monitor))
++		monitor = payload->owner;
++
++	if (!atomic_read(&sk->mod[monitor].has_init))
++		return RET_ERR;
++
++	if (!atomic_read(&sk->mod[monitor].loop_init)) {
++		if (millet_debug)
++			pr_err("monitor %d no hand shake!!", monitor);
++		return RET_ERR;
++	}
++
++	payload->monitor = monitor;
++	ktime_get_ts64(&ts);
++	payload->tm.sec  = ts.tv_sec;
++	payload->tm.nsec = ts.tv_nsec;
++	monitor_port = atomic_read(&sk->mod[monitor].port);
++	dump_send_msg(payload);
++	ret = nlmsg_unicast(sk->sock, skb, monitor_port);
++
++	if (ret < 0) {
++		if (millet_debug)
++			pr_err("nlmsg_unicast failed! %s errno %d\n",
++				__func__, ret);
++		return RET_ERR;
++	} else {
++		if (millet_debug)
++			pr_info("nlmsg_unicast snd msg success to %d\n",
++					monitor_port);
++	}
++
++	return RET_OK;
++}
++EXPORT_SYMBOL_GPL(millet_sendto_user);
++
++
++int millet_sendmsg(enum MILLET_TYPE type, struct task_struct *tsk,
++		struct millet_data *data)
++{
++	u64 walltime, timecost;
++	unsigned long flags;
++	int ret = RET_OK;
++
++	if (!TYPE_VALID(type)) {
++		pr_err("wrong type valid %d\n", type);
++		return RET_ERR;
++	}
++
++	if (!millet_sk.mod[type].send_to) {
++		pr_err("mod %d send_to interface is NULL\n", type);
++		return RET_ERR;
++	}
++
++	walltime = ktime_to_us(ktime_get());
++	ret = millet_sk.mod[type].send_to(tsk, data, &millet_sk);
++	if (!atomic_read(&millet_sk.mod[type].has_init))
++		return ret;
++
++	spin_lock_irqsave(&millet_sk.mod[type].lock, flags);
++
++	if (ret < 0) {
++		millet_sk.mod[type].stat.send_fail++;
++	} else if (ret > 0)
++		millet_sk.mod[type].stat.send_suc++;
++
++	timecost = ktime_to_us(ktime_get()) - walltime;
++	millet_sk.mod[type].stat.runtime += timecost;
++	spin_unlock_irqrestore(&millet_sk.mod[type].lock, flags);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(millet_sendmsg);
++
++
++static void recv_handler(struct sk_buff *skb)
++{
++	struct millet_userconf *payload = NULL;
++	struct nlmsghdr *nlh = NULL;
++	unsigned int msglen = sizeof(struct millet_userconf);
++	uid_t uid = 0;
++	int from = -1;
++
++	if (!skb) {
++		pr_err("recv_handler %s: skb is	NULL!\n", __func__);
++		return;
++	}
++
++	uid = (*NETLINK_CREDS(skb)).uid.val;
++	if (uid > 1000) {
++		pr_err("uid: %d, permission denied\n", uid);
++		return;
++	}
++
++	if (millet_debug)
++		pr_info("kernel millet receive msg now\n");
++
++	if (unlikely(skb->len < NLMSG_SPACE(0))) {
++		pr_err("msg len is invalid\n");
++		return;
++	}
++
++	nlh = nlmsg_hdr(skb);
++	if (nlh->nlmsg_len < NLMSG_SPACE(msglen)) {
++		pr_err("msg len err %d need %d\n",
++		       nlh->nlmsg_len, NLMSG_SPACE(msglen));
++		return;
++	}
++
++	from = nlh->nlmsg_pid;
++	payload = (struct millet_userconf *) NLMSG_DATA(nlh);
++	if (payload->src_port != MILLET_USER_ID) {
++		if (millet_debug) {
++			pr_err("src_port %lx invalid! from %d need len %d len %d\n",
++			       payload->src_port,
++			       from,
++			       nlh->nlmsg_len,
++			       NLMSG_SPACE(msglen));
++			pr_err("-------invalid msg dump------");
++			pr_err("**current pid %d****\n", current->pid);
++		}
++		dump_recv_msg(payload);
++		return;
++	}
++
++	if (payload->dst_port != MILLET_KERNEL_ID) {
++		pr_err("dst_port is %lx not kernel!\n",
++		       payload->dst_port);
++		return;
++	}
++
++	if (!TYPE_VALID(payload->owner)) {
++		pr_err("mod %d is not valid!\n",
++		       payload->owner);
++		return;
++	}
++
++	switch (payload->msg_type) {
++	case LOOPBACK_MSG: {
++		struct millet_data data;
++
++		memset(&data, 0, sizeof(data));
++		data.msg_type = LOOPBACK_MSG;
++		data.owner = payload->owner;
++		atomic_set(&millet_sk.mod[payload->owner].port, from);
++		atomic_set(&millet_sk.mod[payload->owner].loop_init, 1);
++		dump_recv_msg(payload);
++		millet_sendto_user(current, &data, &millet_sk);
++		break;
++	}
++
++	case MSG_TO_KERN: {
++		if (millet_sk.mod[payload->owner].recv_from)
++			millet_sk.mod[payload->owner].recv_from(
++				payload, sizeof(struct millet_userconf));
++
++		if (millet_debug)
++			dump_recv_msg(payload);
++		break;
++	}
++
++	default:
++		pr_err("msg type is valid %d\n", payload->msg_type);
++		break;
++	}
++}
++
++static int millet_sock_show(struct seq_file *m, void *v)
++{
++	int i;
++	unsigned long flags;
++	u64 send_suc[MILLET_TYPES_NUM];
++	u64 send_fail[MILLET_TYPES_NUM];
++	u64 runtime[MILLET_TYPES_NUM];
++	u64 total_send_suc, total_send_fail, total_runtime;
++
++	memset(send_suc, 0, sizeof(u64) * MILLET_TYPES_NUM);
++	memset(send_fail, 0, sizeof(u64) * MILLET_TYPES_NUM);
++	memset(runtime, 0, sizeof(u64) * MILLET_TYPES_NUM);
++
++	for (i = O_TYPE + 1; i < MILLET_TYPES_NUM; i++) {
++		spin_lock_irqsave(&millet_sk.mod[i].lock, flags);
++		send_suc[i] = millet_sk.mod[i].stat.send_suc;
++		send_fail[i] = millet_sk.mod[i].stat.send_fail;
++		runtime[i] = millet_sk.mod[i].stat.runtime;
++		spin_unlock_irqrestore(&millet_sk.mod[i].lock, flags);
++	}
++
++	total_send_suc = total_send_fail = total_runtime = 0;
++	seq_printf(m, "-----------------------------\n\n");
++	for (i = O_TYPE + 1; i < MILLET_TYPES_NUM; i++) {
++		if (!send_suc[i] && !send_fail[i])
++			continue;
++
++		total_send_suc += send_suc[i];
++		total_send_fail += send_fail[i];
++		total_runtime += runtime[i];
++
++		seq_printf(m, "name: %s mod id %d:\n",
++		           millet_sk.mod[i].name, i);
++		seq_printf(m, "send suc: %llu\n", send_suc[i]);
++		seq_printf(m, "send fail: %llu\n", send_fail[i]);
++		seq_printf(m, "runtime: %llu us\n\n", runtime[i]);
++
++	}
++
++	seq_printf(m, "---------total info--------------------\n");
++	seq_printf(m, "send_suc: %llu\n", total_send_suc);
++	seq_printf(m, "send_fail: %llu\n", total_send_fail);
++	seq_printf(m, "runtime: %llu us\n", total_runtime);
++	return 0;
++}
++
++static int millet_stat_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, millet_sock_show, NULL);
++}
++
++static void stat_reset(void)
++{
++	int i;
++	unsigned long flags;
++
++	for (i = O_TYPE + 1; i < MILLET_TYPES_NUM; i++) {
++		spin_lock_irqsave(&millet_sk.mod[i].lock, flags);
++		millet_sk.mod[i].stat.send_suc = 0;
++		millet_sk.mod[i].stat.send_fail = 0;
++		millet_sk.mod[i].stat.runtime = 0;
++		spin_unlock_irqrestore(&millet_sk.mod[i].lock, flags);
++	}
++}
++
++static ssize_t millet_stat_write(struct file *filp,
++		const char __user *buf, size_t count, loff_t *f_ops)
++{
++	unsigned char tmp = 0;
++	int value = 0;
++
++	get_user(tmp, buf);
++	value = simple_strtol(&tmp, NULL, 10);
++	pr_info("input value number: %d\n", value);
++	if (value == 1)
++		stat_reset();
++
++	printk(KERN_WARNING "stat reset now\n");
++	return count;
++}
++
++static const struct proc_ops millet_proc_fops = {
++	.proc_open   = millet_stat_open,
++	.proc_read   = seq_read,
++	.proc_write   = millet_stat_write,
++	.proc_lseek   = seq_lseek,
++	.proc_release   = single_release,
++};
++
++static int millet_version_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "%d\n", millet_v);
++	return 0;
++}
++
++static int millet_version_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, millet_version_show, NULL);
++}
++
++static const struct proc_ops millet_version_fops = {
++	.proc_open   = millet_version_open,
++	.proc_read   = seq_read,
++	.proc_lseek   = seq_lseek,
++	.proc_release   = single_release,
++};
++
++int register_millet_hook(int type, recv_hook recv_from,
++		send_hook send_to, init_hook init)
++{
++	if (!TYPE_VALID(type)) {
++		pr_err("%s: type is invalid! %d\n",
++				__func__, type);
++		return RET_ERR;
++	}
++
++	if (millet_sk.mod[type].init) {
++		pr_err("%s: init has been registered %d\n",
++		       __func__, type);
++		return RET_ERR;
++	} else
++		millet_sk.mod[type].init = init;
++
++	if (millet_sk.mod[type].recv_from) {
++		pr_err("%s: recv_from has been registered %d\n",
++		       __func__, type);
++		return RET_ERR;
++	} else
++		millet_sk.mod[type].recv_from = recv_from;
++
++	if (millet_sk.mod[type].send_to) {
++		pr_err("%s: send_to has been registered %d\n",
++		       __func__, type);
++		return RET_ERR;
++	} else
++		millet_sk.mod[type].send_to = send_to;
++
++	if (millet_debug) {
++		printk("type %d register hook\n", type);
++		dump_stack();
++	}
++
++	return RET_OK;
++}
++EXPORT_SYMBOL_GPL(register_millet_hook);
++
++
++int unregister_millet_hook(int type)
++{
++	if (!TYPE_VALID(type)) {
++		pr_err("%s: type is invalid! %d\n",
++		       __func__, type);
++		return RET_ERR;
++	}
++
++	millet_sk.mod[type].recv_from = NULL;
++	millet_sk.mod[type].send_to = NULL;
++	millet_sk.mod[type].init = NULL;
++	return RET_OK;
++}
++EXPORT_SYMBOL_GPL(unregister_millet_hook);
++
++int init_millet_subsystem(int type)
++{
++	if (!TYPE_VALID(type)) {
++		pr_err("%s: type is invalid! %d\n",
++				__func__, type);
++		return RET_ERR;
++	}
++
++	atomic_set(&millet_sk.mod[type].port, 0);
++	atomic_set(&millet_sk.mod[type].loop_init, 0);
++	spin_lock_init(&millet_sk.mod[type].lock);
++	if (millet_sk.mod[type].init)
++		millet_sk.mod[type].init(&millet_sk);
++
++	strlcpy(millet_sk.mod[type].name, NAME_ARRAY[type], NAME_MAXLEN);
++	return RET_OK;
++}
++EXPORT_SYMBOL_GPL(init_millet_subsystem);
++
++
++static int __init millet_init(void)
++{
++	int ret = RET_ERR;
++	struct proc_dir_entry *millet_stat_entry = NULL;
++	struct proc_dir_entry *millet_version_entry = NULL;
++
++	struct netlink_kernel_cfg cfg = {
++		.input = recv_handler,
++	};
++
++	pr_err("enter millet_init func!\n");
++	millet_sk.sock =
++		netlink_kernel_create(&init_net, NETLINK_MILLET, &cfg);
++	if (!millet_sk.sock) {
++		pr_err("%s: create socket error!\n", __func__);
++		return ret;
++	}
++
++	millet_rootdir = proc_mkdir("millet", NULL);
++	if (!millet_rootdir)
++		pr_err("create /proc/millet failed\n");
++	else {
++		millet_stat_entry = proc_create("millet_stat",
++			0644, millet_rootdir, &millet_proc_fops);
++		if (!millet_stat_entry)
++			pr_err("create millet stat failed\n");
++
++		millet_version_entry = proc_create("version",
++			0644, millet_rootdir, &millet_version_fops);
++		if (!millet_version_entry)
++			pr_err("create millet version failed\n");
++	}
++
++	return RET_OK;
++}
++
++device_initcall(millet_init);
++
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/xiaomi/millet/millet_hs.c b/drivers/misc/xiaomi/millet/millet_hs.c
+new file mode 100755
+index 000000000..7ef2b951d
+--- /dev/null
++++ b/drivers/misc/xiaomi/millet/millet_hs.c
+@@ -0,0 +1,70 @@
++#define pr_fmt(fmt) "millet-millet_hs: " fmt
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include "millet.h"
++extern int millet_sendmsg(enum MILLET_TYPE type, struct task_struct *t,
++		struct millet_data *data);
++extern int millet_sendto_user(struct task_struct *tsk,
++		struct millet_data *data, struct millet_sock *sk);
++extern int register_millet_hook(int type, recv_hook recv_from, send_hook send_to,
++		init_hook init);
++extern int unregister_millet_hook(int type);
++extern int init_millet_subsystem(int type);
++
++
++
++static int hs_sendmsg(struct task_struct *tsk,
++                struct millet_data *data, struct millet_sock *sk)
++{
++        int ret = 0;
++
++        if (!sk || !data) {
++                pr_err("%s input invalid\n", __FUNCTION__);
++                return RET_ERR;
++        }
++
++        data->msg_type = MSG_TO_USER;
++        data->owner = HANDSHK_TYPE;
++	ret = millet_sendto_user(tsk, data, sk);
++
++	return ret;
++}
++
++static void hs_recv_hook(void *nouse, unsigned int len)
++{
++	struct millet_data data;
++
++	memset(&data, 0, sizeof(data));
++	millet_sendmsg(HANDSHK_TYPE, current, &data);
++}
++
++static void hs_init_millet(struct millet_sock *sk)
++{
++	if (sk) {
++		sk->mod[HANDSHK_TYPE].monitor = SIG_TYPE;
++		atomic_set(&sk->mod[HANDSHK_TYPE].has_init, 1);
++	}
++}
++
++static int __init millet_hs_init(void)
++{
++
++	pr_err("enter millet_hs_init func!\n");
++	register_millet_hook(HANDSHK_TYPE, hs_recv_hook, hs_sendmsg,
++		hs_init_millet);
++	init_millet_subsystem(HANDSHK_TYPE);
++
++	return RET_OK;
++}
++
++static void __exit millet_hs_exit(void)
++{
++	unregister_millet_hook(HANDSHK_TYPE);
++}
++
++late_initcall(millet_hs_init);
++module_exit(millet_hs_exit);
++
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/xiaomi/millet/millet_pkg.c b/drivers/misc/xiaomi/millet/millet_pkg.c
+new file mode 100755
+index 000000000..b6a8faed7
+--- /dev/null
++++ b/drivers/misc/xiaomi/millet/millet_pkg.c
+@@ -0,0 +1,323 @@
++#define pr_fmt(fmt) "millet-millet_pkg: " fmt
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/skbuff.h>
++#include <linux/file.h>
++#include <linux/netfilter.h>
++#include <linux/netfilter_ipv4.h>
++#include <linux/netfilter_ipv6.h>
++#include <linux/spinlock.h>
++#include <linux/rbtree.h>
++#include <linux/ktime.h>
++#include <linux/time.h>
++#include <linux/list.h>
++#include <linux/types.h>
++#include <net/sock.h>
++#include <net/ip.h>
++#include <net/tcp.h>
++#include <net/inet_hashtables.h>
++#include <net/inet6_hashtables.h>
++#include "millet.h"
++
++
++#define MAX_REC_UID 64
++static atomic_t uid_rec[MAX_REC_UID];
++extern int millet_sendmsg(enum MILLET_TYPE type, struct task_struct *t,
++		struct millet_data *data);
++extern int millet_sendto_user(struct task_struct *tsk,
++		struct millet_data *data, struct millet_sock *sk);
++extern int register_millet_hook(int type, recv_hook recv_from, send_hook send_to,
++		init_hook init);
++extern int unregister_millet_hook(int type);
++extern int init_millet_subsystem(int type);
++
++
++
++int pkg_stat_show(struct seq_file *m, void *v)
++{
++	int i;
++
++	for (i = 0; i < MAX_REC_UID; i++)
++		if (atomic_read(&uid_rec[i]))
++			seq_printf(m, "%d\t", atomic_read(&uid_rec[i]));
++	seq_printf(m, "\n");
++
++	return 0;
++}
++
++static void pkg_add_uid(uid_t uid)
++{
++	int i, j;
++	uid_t inner_uid;
++
++	for (i = 0, j = MAX_REC_UID; i < MAX_REC_UID; i++) {
++		inner_uid = atomic_read(&uid_rec[i]);
++		if (inner_uid == 0 && j == MAX_REC_UID)
++			j = i;
++		else if (inner_uid == uid)
++			goto out;
++	}
++
++	if (j < MAX_REC_UID)
++		atomic_set(&uid_rec[j], uid);
++	else
++		pr_err("%s : add uid:%d failed (full)!\n", __func__, uid);
++
++out:
++	return;
++}
++
++static int pkg_sendmsg(struct task_struct *tsk,
++		struct millet_data *data, struct millet_sock *sk)
++{
++	int ret = RET_OK;
++
++	if (!sk || !data || !tsk) {
++		pr_err("%s input invalid\n", __FUNCTION__);
++		return RET_ERR;
++	}
++
++	data->msg_type = MSG_TO_USER;
++	data->owner = PKG_TYPE;
++	data->uid = data->mod.k_priv.pkg.pkg_owner;
++	ret = millet_sendto_user(tsk, data, sk);
++
++	return ret;
++}
++
++static void pkg_del_uid(uid_t uid)
++{
++	int i;
++	uid_t inner_uid;
++
++	for (i = 0; i < MAX_REC_UID; i++) {
++		inner_uid = (uid_t) atomic_read(&uid_rec[i]);
++		if (inner_uid == uid) {
++			atomic_set(&uid_rec[i], 0);
++			break;
++		}
++	}
++
++	return;
++}
++
++static void pkg_clear_all(void)
++{
++	int i;
++
++	for (i = 0; i < MAX_REC_UID; i++)
++		atomic_set(&uid_rec[i], 0);
++
++	return;
++}
++
++static int find_and_clear_uid(uid_t uid)
++{
++	int found = 0;
++	int i = 0;
++	uid_t inner_uid;
++
++	for (i = 0; i < MAX_REC_UID; i++) {
++		inner_uid = atomic_read(&uid_rec[i]);
++		if (unlikely(inner_uid == uid)) {
++			if (atomic_cmpxchg(&uid_rec[i], uid, 0) == uid)
++				found = 1;
++			break;
++		}
++	}
++
++	return found;
++}
++
++static void pkg_recv_hook(void *data, unsigned int len)
++{
++	struct millet_userconf *payload = (struct millet_userconf *) data;
++
++	switch (payload->mod.u_priv.pkg.cmd) {
++	case ADD_UID:
++		pkg_add_uid(payload->mod.u_priv.pkg.uid);
++		break;
++	case DEL_UID:
++		pkg_del_uid(payload->mod.u_priv.pkg.uid);
++		break;
++	case CLEAR_ALL_UID:
++		pkg_clear_all();
++		break;
++	default:
++		break;
++	}
++
++	return;
++}
++
++static void pkg_init_millet(struct millet_sock *sk)
++{
++	if (sk) {
++		sk->mod[PKG_TYPE].monitor = PKG_TYPE;
++		atomic_set(&sk->mod[PKG_TYPE].has_init, 1);
++	}
++}
++
++static uid_t __sock_i_uid(struct sock *sk)
++{
++	uid_t uid;
++
++	read_lock_bh(&sk->sk_callback_lock);
++	if (sk->sk_socket)
++		uid = SOCK_INODE(sk->sk_socket)->i_uid.val;
++	else
++		uid = 0;
++	read_unlock_bh(&sk->sk_callback_lock);
++
++	return uid;
++}
++
++static unsigned int pkg_ip4_in(void *priv, struct sk_buff *skb,
++		const struct nf_hook_state *state)
++{
++	struct sock *sk;
++	struct millet_data data;
++	uid_t uid;
++	int found;
++	int protocol;
++
++	memset(&data, 0, sizeof(data));
++	protocol = ip_hdr(skb)->protocol;
++	if (protocol != IPPROTO_TCP)
++		return NF_ACCEPT;
++
++	sk = skb_to_full_sk(skb);
++	if (sk == NULL || !sk_fullsock(sk))
++		return NF_ACCEPT;
++
++	uid = __sock_i_uid(sk);
++	if (uid < UID_MIN_VALUE)
++		return NF_ACCEPT;
++
++	found = find_and_clear_uid(uid);
++	if (!found)
++		return NF_ACCEPT;
++	data.mod.k_priv.pkg.owner_pid = 0;
++	data.mod.k_priv.pkg.pkg_owner = (int) uid;
++	if (millet_sendmsg(PKG_TYPE, current, &data) < 0)
++		pr_err("%s : up report failed!\n", __func__);
++
++	return NF_ACCEPT;
++}
++
++static unsigned int pkg_ip6_in(void *priv, struct sk_buff *skb,
++		const struct nf_hook_state *state)
++{
++	struct sock *sk;
++	struct millet_data data;
++	unsigned int thoff = 0;
++	unsigned short frag_off = 0;
++	int protohdr;
++	uid_t uid;
++	int found;
++
++	memset(&data, 0, sizeof(data));
++	protohdr = ipv6_find_hdr(skb, &thoff, -1, &frag_off, NULL);
++	if (protohdr != IPPROTO_TCP)
++		return NF_ACCEPT;
++
++	sk = skb_to_full_sk(skb);
++	if (sk == NULL || !sk_fullsock(sk))
++		return NF_ACCEPT;
++
++	uid = __sock_i_uid(sk);
++	if (uid < UID_MIN_VALUE)
++		return NF_ACCEPT;
++
++	found = find_and_clear_uid(uid);
++	if (!found)
++		return NF_ACCEPT;
++
++	data.mod.k_priv.pkg.owner_pid = 0;
++	data.mod.k_priv.pkg.pkg_owner = (int) uid;
++	if (millet_sendmsg(PKG_TYPE, current, &data) < 0)
++		pr_err("%s : up report failed!\n", __func__);
++
++	return NF_ACCEPT;
++}
++
++static inline unsigned int pkg_ip4_out(void *priv, struct sk_buff *skb,
++		const struct nf_hook_state *state)
++{
++	return NF_ACCEPT;
++}
++
++static inline unsigned int pkg_ip6_out(void *priv, struct sk_buff *skb,
++		const struct nf_hook_state *state)
++{
++	return NF_ACCEPT;
++}
++
++static struct nf_hook_ops pkg_nf_ops[] = {
++
++		{
++				.hook        =    pkg_ip4_in,
++				.pf        =    NFPROTO_IPV4,
++				.hooknum    =    NF_INET_LOCAL_IN,
++				.priority    =    NF_IP_PRI_SELINUX_LAST + 1,
++		},
++		{
++				.hook   =    pkg_ip6_in,
++				.pf        =    NFPROTO_IPV6,
++				.hooknum    =    NF_INET_LOCAL_IN,
++				.priority    =    NF_IP6_PRI_SELINUX_LAST + 1,
++		},
++
++		{
++				.hook        =    pkg_ip4_out,
++				.pf        =    NFPROTO_IPV4,
++				.hooknum    =    NF_INET_LOCAL_OUT,
++				.priority    =    NF_IP_PRI_SELINUX_LAST + 1,
++		},
++		{
++				.hook        =    pkg_ip6_out,
++				.pf        =    NFPROTO_IPV6,
++				.hooknum    =    NF_INET_LOCAL_OUT,
++				.priority    =    NF_IP6_PRI_SELINUX_LAST + 1,
++		},
++
++};
++
++static int __init millet_pkg_init(void)
++{
++	int ret;
++	int i;
++	struct net *net = &init_net;
++
++	pr_err("enter millet_pkg_init func!\n");
++
++	for (i = 0; i < MAX_REC_UID; i++)
++		atomic_set(&uid_rec[i], 0);
++
++	ret = nf_register_net_hooks(net, pkg_nf_ops, ARRAY_SIZE(pkg_nf_ops));
++	if (ret < 0) {
++		pr_err("nf_register_hooks(millet hooks) error\n");
++		return RET_ERR;
++	}
++	pr_err("nf_register_hooks(millet hooks) success\n");
++	register_millet_hook(PKG_TYPE, pkg_recv_hook, pkg_sendmsg,
++			pkg_init_millet);
++	init_millet_subsystem(PKG_TYPE);
++
++	return RET_OK;
++}
++
++static void __exit millet_pkg_exit(void)
++{
++	struct net *net = &init_net;
++
++	unregister_millet_hook(PKG_TYPE);
++	nf_unregister_net_hooks(net, pkg_nf_ops, ARRAY_SIZE(pkg_nf_ops));
++}
++
++
++late_initcall(millet_pkg_init);
++module_exit(millet_pkg_exit);
++
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/xiaomi/millet/millet_sig.c b/drivers/misc/xiaomi/millet/millet_sig.c
+new file mode 100755
+index 000000000..c4c932b96
+--- /dev/null
++++ b/drivers/misc/xiaomi/millet/millet_sig.c
+@@ -0,0 +1,83 @@
++#define pr_fmt(fmt) "millet_millet-sig: " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/freezer.h>
++#include <linux/signal.h>
++#include "millet.h"
++#include <trace/hooks/signal.h>
++
++static int last_report_task;
++extern int millet_sendmsg(enum MILLET_TYPE type, struct task_struct *t,
++		struct millet_data *data);
++extern int millet_sendto_user(struct task_struct *tsk,
++		struct millet_data *data, struct millet_sock *sk);
++extern int register_millet_hook(int type, recv_hook recv_from, send_hook send_to,
++		init_hook init);
++extern int init_millet_subsystem(int type);
++
++void millet_sig(void *d, int sig, struct task_struct *killer, struct task_struct *dst)
++{
++	struct millet_data data;
++
++	if (sig == SIGKILL
++			|| sig == SIGTERM
++			|| sig == SIGABRT
++			|| sig == SIGQUIT) {
++		memset(&data, 0, sizeof(data));
++		data.mod.k_priv.sig.caller_task = current;
++		data.mod.k_priv.sig.killed_task = dst;
++		data.mod.k_priv.sig.reason = KILLED_BY_PRO;
++		data.pri[0] = sig;
++		millet_sendmsg(SIG_TYPE, dst, &data);
++	}
++}
++EXPORT_SYMBOL_GPL(millet_sig);
++
++static int signals_sendmsg(struct task_struct *tsk,
++		struct millet_data *data, struct millet_sock *sk)
++{
++	int ret = 0;
++
++	if (!sk || !data || !tsk) {
++		pr_err("%s input invalid\n", __FUNCTION__);
++		return RET_ERR;
++	}
++
++	data->mod.k_priv.sig.killed_pid = task_tgid_nr(tsk);
++	data->uid = task_uid(tsk).val;
++	data->msg_type = MSG_TO_USER;
++	data->owner = SIG_TYPE;
++
++	if (frozen_task_group(tsk)
++		&& (data->mod.k_priv.sig.killed_pid != *(int *)sk->mod[SIG_TYPE].priv)) {
++		*(int *)sk->mod[SIG_TYPE].priv = data->mod.k_priv.sig.killed_pid;
++		ret = millet_sendto_user(tsk, data, sk);
++	}
++
++	return ret;
++}
++
++static void signas_init_millet(struct millet_sock *sk)
++{
++	if (sk) {
++		sk->mod[SIG_TYPE].monitor = SIG_TYPE;
++		sk->mod[SIG_TYPE].priv = (void *)&last_report_task;
++		atomic_set(&sk->mod[SIG_TYPE].has_init, 1);
++	}
++}
++
++static int __init sig_mod_init(void)
++{
++	pr_err("enter sig_mod_init func!\n");
++
++	register_millet_hook(SIG_TYPE, NULL,
++		signals_sendmsg, signas_init_millet);
++	init_millet_subsystem(SIG_TYPE);
++	register_trace_android_vh_do_send_sig_info(millet_sig, NULL);
++
++	return 0;
++}
++
++late_initcall(sig_mod_init);
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/xiaomi/millet/uapi/millet.h b/drivers/misc/xiaomi/millet/uapi/millet.h
+new file mode 100755
+index 000000000..0e20b7ff4
+--- /dev/null
++++ b/drivers/misc/xiaomi/millet/uapi/millet.h
+@@ -0,0 +1,171 @@
++#ifndef UAPI_MILLET_H
++#define UAPI_MILLET_H
++
++#ifndef NETLINK_MILLET
++#define NETLINK_MILLET		31
++#endif
++
++#define MILLET_KERNEL_ID	0x12341234
++#define MILLET_USER_ID		0xabcddcba
++#define UID_MIN_VALUE		10000
++#define NAME_MAXLEN		32
++#define EXT_LEN			6
++
++#ifndef ENUM_BINDER_STAT
++#define ENUM_BINDER_STAT
++enum BINDER_STAT {
++	BINDER_IN_IDLE,
++	BINDER_IN_BUSY,
++	BINDER_THREAD_IN_BUSY,
++	BINDER_PROC_IN_BUSY,
++	BINDER_IN_TRANSACTION,
++	BINDER_ST_NUM,
++};
++#endif
++
++enum MILLET_VERSION {
++	VERSION_1_0 = 1,
++	VERSION_2_0,
++};
++
++enum SIG_STAT {
++	KILLED_BY_PRO,
++	KILLED_BY_LMK,
++};
++
++enum MSG_TYPE {
++	O_MSG,
++	LOOPBACK_MSG,
++	MSG_TO_USER,
++	MSG_TO_KERN,
++	MSG_END,
++};
++
++#define MSG_VALID(x) ((x > O_MSG) && (x < MSG_END))
++
++enum MILLET_TYPE {
++	O_TYPE,
++	SIG_TYPE,
++	BINDER_TYPE,
++	BINDER_ST_TYPE,
++	MEM_TYPE,
++	PKG_TYPE,
++	HANDSHK_TYPE,
++	MILLET_TYPES_NUM,
++};
++
++#define TYPE_VALID(x) ((x > O_TYPE) && (x < MILLET_TYPES_NUM))
++static const char *NAME_ARRAY[NAME_MAXLEN] = {
++	"NULL",
++	"SIG",
++	"BINDER",
++	"BINDER_STAT",
++	"MEM",
++	"PKG",
++	"HANDSHK",
++	"invalid",
++};
++
++enum BINDER_EXTRA_MSG {
++	BINDER_BUFF_WARN,
++	BINDER_REPLY,
++	BINDER_TRANS,
++	BINDER_THREAD_HAS_WORK,
++};
++
++enum PKG_CMD {
++	CMD_NOP,
++	ADD_UID,
++	DEL_UID,
++	CLEAR_ALL_UID,
++	CMD_END,
++};
++
++struct time_stamp {
++	unsigned long long sec;
++	long nsec;
++};
++
++struct millet_data {
++	enum MILLET_TYPE owner;
++	enum MILLET_TYPE monitor;
++	enum MSG_TYPE msg_type;
++	unsigned long src_port;
++	unsigned long dst_port;
++	int uid;
++	struct time_stamp tm;
++	unsigned long pri[EXT_LEN];
++	union {
++		union {
++			struct sig_s {
++				void *caller_task;
++				void *killed_task;
++				int killed_pid;
++				enum SIG_STAT reason;
++			} sig;
++
++			union {
++				struct stat_s {
++					void *task;
++					int pid;
++					int tid;
++					enum BINDER_STAT reason;
++				} stat;
++				struct trans_s {
++					void *src_task;
++					void *dst_task;
++					int caller_uid;
++					int caller_pid;
++					int caller_tid;
++					int dst_pid;
++					bool tf_oneway;
++					unsigned int	code;
++				} trans;
++			} binder;
++
++			struct pkg_s {
++				int pkg_owner;
++				int owner_pid;
++			} pkg;
++
++			struct mem_s {
++			} mem;
++
++			struct game_s {
++			} game;
++
++		} k_priv;
++
++		union {
++			unsigned long data;
++		} comm;
++	} mod;
++
++};
++
++struct millet_userconf{
++	enum MILLET_TYPE owner;
++	enum MSG_TYPE msg_type;
++	unsigned long src_port;
++	unsigned long dst_port;
++	unsigned long pri[EXT_LEN];
++	union {
++		union {
++			unsigned long data;
++		} comm;
++
++		union {
++			struct pkg_user {
++				enum PKG_CMD cmd;
++				int uid;
++			} pkg;
++
++			struct binder_st_user {
++				int uid;
++			} binder_st;
++		} u_priv;
++	} mod;
++
++
++};
++#endif

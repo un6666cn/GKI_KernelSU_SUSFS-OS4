@@ -1,0 +1,170 @@
+name: pure-gki
+
+on:
+  workflow_dispatch:
+    inputs:
+      refs:
+        description: "ACK branch/tag names as JSON array"
+        required: false
+        default: '["android13-5.15-2026-09"]'
+      clangs:
+        description: "clang major versions as JSON array"
+        required: false
+        default: "[14]"
+      ksu_commit:
+        description: "KernelSU commit SHA"
+        required: false
+        default: "a23184a0e0362c10f027718b309f53e0c867b02e"
+      brand:
+        description: "Kernel version suffix"
+        required: false
+        default: "OS4-M2381"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ fromJSON(inputs.refs) }}
+        clang: ${{ fromJSON(inputs.clangs) }}
+    name: ${{ matrix.ref }} / clang-${{ matrix.clang }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+
+      - name: Setup swap (LTO link needs headroom)
+        run: |
+          CUR=$(free -g | awk '/^Swap:/{print $2}')
+          echo "current swap: ${CUR:-0} GiB"
+          if [ "${CUR:-0}" -lt 12 ]; then
+            sudo fallocate -l 16G /swapfile2 || { sudo rm -f /swapfile2; sudo dd if=/dev/zero of=/swapfile2 bs=1M count=16384 status=none; }
+            sudo chmod 600 /swapfile2
+            sudo mkswap /swapfile2
+            sudo swapon /swapfile2
+          fi
+          free -h
+
+      - name: Checkout CI patches
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Clone ACK kernel source
+        run: |
+          set -eux
+          git clone --depth=1 --single-branch -b "${{ matrix.ref }}" https://android.googlesource.com/kernel/common kernel
+          cd kernel
+          head -6 Makefile
+          echo "== source version: $(make -s kernelversion 2>/dev/null || true)"
+
+      - name: Apply Meizu 20 patches
+        run: |
+          set -eux
+          cd kernel
+          for p in ../ci/patches/pure-gki/*.patch; do
+            echo "== applying $p"
+            patch -p1 --forward --fuzz=3 --no-backup-if-mismatch < "$p"
+          done
+          grep -q 'trace_android_vh_extfrag_for_order' mm/vmstat.c
+          grep -q 'trace_android_vh_smartzram_tune_swappiness' mm/vmscan.c
+          grep -q 'EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_extfrag_for_order)' drivers/android/vendor_hooks.c
+          grep -q 'CONFIG_XIAOMI_MILLET=y' arch/arm64/configs/gki_defconfig
+          grep -q 'CONFIG_MI_THERMAL_INTERFACE=y' arch/arm64/configs/gki_defconfig
+          test -f drivers/misc/xiaomi/millet/millet_core.c
+          test -f drivers/thermal/mi_thermal_interface.c
+
+      - name: Setup KernelSU
+        uses: ./.github/actions/root-setup
+        with:
+          flavor: kernelsu
+          commit: ${{ inputs.ksu_commit }}
+
+      - name: Set kernel version suffix and recovery safety
+        working-directory: kernel
+        run: |
+          set -eux
+          bash scripts/config --file arch/arm64/configs/gki_defconfig --set-str LOCALVERSION "-${{ inputs.brand }}"
+          bash scripts/config --file arch/arm64/configs/gki_defconfig --disable LOCALVERSION_AUTO
+          bash scripts/config --file arch/arm64/configs/gki_defconfig --enable MODULE_FORCE_LOAD
+          grep -q "CONFIG_LOCALVERSION=\"-${{ inputs.brand }}\"" arch/arm64/configs/gki_defconfig
+          grep -q '# CONFIG_LOCALVERSION_AUTO is not set' arch/arm64/configs/gki_defconfig
+          grep -q 'CONFIG_MODULE_FORCE_LOAD=y' arch/arm64/configs/gki_defconfig
+
+      - name: Install toolchain (clang-${{ matrix.clang }})
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev lz4 zstd cpio kmod rsync python3 dwarves wget xz-utils ccache
+          if [ "${{ matrix.clang }}" = "14" ]; then
+            sudo apt-get install -y -qq clang-14 lld-14 llvm-14
+          else
+            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+            chmod +x /tmp/llvm.sh
+            sudo /tmp/llvm.sh ${{ matrix.clang }}
+            sudo apt-get install -y -qq clang-${{ matrix.clang }} lld-${{ matrix.clang }} llvm-${{ matrix.clang }}
+          fi
+          V=${{ matrix.clang }}
+          mkdir -p "$HOME/llvm-bin"
+          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-readobj llvm-size llvm-strip llvm-as llvm-dis llvm-link opt; do
+            src="$(command -v "${t}-${V}" || true)"
+            if [ -n "$src" ]; then ln -sf "$src" "$HOME/llvm-bin/$t"; fi
+          done
+          echo "$HOME/llvm-bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/llvm-bin:$PATH"
+          clang --version | head -1
+          ld.lld --version | head -1
+          pahole --version
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.ref }}-clang${{ matrix.clang }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.ref }}-clang${{ matrix.clang }}-
+
+      - name: Build Image
+        env:
+          CCACHE_DIR: /home/runner/.ccache
+          CCACHE_MAXSIZE: 6G
+          CCACHE_COMPRESS: "true"
+          CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime
+        run: |
+          set -euo pipefail
+          cd kernel
+          export ARCH=arm64
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" -j"$(nproc)" gki_defconfig
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" -j"$(nproc)" olddefconfig
+          echo "== effective config (key items) =="
+          grep -E '^CONFIG_LTO|^CONFIG_CFI|^CONFIG_TRIM_UNUSED_KSYMS|^CONFIG_MODVERSIONS|^CONFIG_MODULE_SIG|^CONFIG_MODULE_FORCE_LOAD|^CONFIG_DEBUG_INFO_BTF|^CONFIG_LOCALVERSION|^CONFIG_KSU|^CONFIG_SYSVIPC|^CONFIG_USER_NS|^CONFIG_PID_NS|^CONFIG_IPC_NS|^CONFIG_DEVTMPFS|^CONFIG_LRU_GEN_ENABLED|^CONFIG_ZRAM|^CONFIG_ZSMALLOC' out/.config || true
+          if grep -q '^CONFIG_TRIM_UNUSED_KSYMS=y' out/.config; then
+            ./scripts/config --file out/.config -d TRIM_UNUSED_KSYMS
+            make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" -j"$(nproc)" olddefconfig
+            echo "[+] TRIM_UNUSED_KSYMS disabled (plain make does not generate the ABI whitelist)"
+          fi
+          time make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" -j"$(nproc)" Image
+          ls -la out/arch/arm64/boot/Image
+          strings out/arch/arm64/boot/Image | grep -m1 'Linux version 5\.15' || true
+          grep -q ' millet_init$' out/System.map
+          grep -q ' mi_thermal_interface_init$' out/System.map
+          grep -q ' ksu_init$' out/System.map || grep -q ' kernelsu' out/System.map
+          grep -c '^CONFIG_' out/.config
+          ccache --show-stats
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: meizu20-pure-${{ matrix.ref }}-clang${{ matrix.clang }}-${{ inputs.brand }}
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/.config
+            kernel/out/System.map
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 6

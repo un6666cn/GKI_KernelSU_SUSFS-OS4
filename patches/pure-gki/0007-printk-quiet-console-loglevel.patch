@@ -1,0 +1,26 @@
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index 49d97f204..a5b733f20 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -71,6 +71,21 @@ int console_printk[4] = {
+ };
+ EXPORT_SYMBOL_GPL(console_printk);
+ 
++/*
++ * Meizu 20 port: the stock vendor_boot passes "console=ttyMSM0,115200n8
++ * loglevel=7".  The Meizu stock kernel gates console output through
++ * CONFIG_MZ_CONSOLE_OUTPUT_DYNAMIC; plain ACK lacks that gate, so every
++ * printk up to KERN_DEBUG is written synchronously to the 115200-baud UART,
++ * blocking the calling thread for milliseconds (visible as system UI jank).
++ * Keep the ring buffer but force a quiet console at boot.
++ */
++static int __init meizu_quiet_console_init(void)
++{
++	console_loglevel = CONSOLE_LOGLEVEL_MIN;
++	return 0;
++}
++early_initcall(meizu_quiet_console_init);
++
+ atomic_t ignore_console_lock_warning __read_mostly = ATOMIC_INIT(0);
+ EXPORT_SYMBOL(ignore_console_lock_warning);
+ 
