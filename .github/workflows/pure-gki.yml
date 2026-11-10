@@ -52,8 +52,6 @@ jobs:
 
       - name: Checkout CI patches
         uses: actions/checkout@v4
-        with:
-          path: ci
 
       - name: Clone ACK kernel source
         run: |
@@ -67,7 +65,7 @@ jobs:
         run: |
           set -eux
           cd kernel
-          for p in ../ci/patches/pure-gki/*.patch; do
+          for p in ../patches/pure-gki/*.patch; do
             echo "== applying $p"
             patch -p1 --forward --fuzz=3 --no-backup-if-mismatch < "$p"
           done
