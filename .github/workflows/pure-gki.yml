@@ -83,6 +83,19 @@ jobs:
           flavor: kernelsu
           commit: ${{ inputs.ksu_commit }}
 
+      - name: Skip KernelSU preinit in recovery
+        working-directory: kernel
+        run: |
+          set -eux
+          # PID 1 in recovery re-execs the ramdisk init, whose /system is not a
+          # mount, and the preinit runner's final exec of /system/bin/init then
+          # fails (exit 127, "Attempted to kill init").  Preinit has nothing to
+          # run there anyway: /metadata is not mounted.  Leave recovery's init
+          # exec alone and keep preinit for normal boots.
+          patch -p1 --forward --fuzz=3 --no-backup-if-mismatch < ../patches/ksu-preinit-recovery.patch
+          grep -q 'ksu_preinit_in_recovery' KernelSU/kernel/preinit/preinit.c
+          grep -q 'klog_emerg' KernelSU/kernel/preinit/runner/runner.c
+
       - name: Set kernel version suffix and recovery safety
         working-directory: kernel
         run: |

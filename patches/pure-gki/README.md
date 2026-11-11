@@ -121,6 +121,26 @@ Droidspaces 在 GKI 上启用 `CONFIG_SYSVIPC` / `CONFIG_IPC_NS` / `CONFIG_POSIX
 MGLRU 的 `lru_gen_min_ttl` 默认值由 0 改为 `HZ`（1 秒），对应
 `/sys/kernel/mm/lru_gen/min_ttl_ms` 默认 1000，与设备运行态实验值一致，重启后保持。
 
+## ksu-preinit-recovery.patch
+
+KernelSU 的 preinit 在 `__init` 阶段把 runner 静态 ELF 放进 shmem，随后在 PID 1
+执行 `/system/bin/init selinux_setup` 时把文件名换成 `/proc/self/fd/N` 交给
+runner；runner 跑完模块 preinit 动作后再 `execve("/system/bin/init")` 回到真正的
+init。
+
+recovery 启动时 first stage 不挂载 `/system`（`DoFirstStageMount` 在 recovery
+模式直接返回），`/system/bin/init` 是 ramdisk 里的 init；此时 runner 最后一次
+`execve("/system/bin/init")` 失败，runner `return 127`，内核报
+`Attempted to kill init! exitcode=0x00007f00`，recovery 黑屏后重启。
+
+recovery 下 `/metadata` 未挂载，preinit 本来也没有动作可跑，因此按 AOSP
+`IsRecoveryMode()` 同一判据（`/system/bin/recovery` 存在）在 hook 处直接跳过
+preinit 并释放 runner，让原始的 init exec 继续；正常启动行为不变。同时把 runner
+最后一次 exec 失败的日志改为 `<0>`（KERN_EMERG），以便本机控制台门限下仍能从
+pstore 读到 errno。
+
+该补丁在 `Setup KernelSU` 之后单独应用，路径为 `KernelSU/kernel/preinit/`。
+
 ## 验收判据
 
 对产物 Image 重建符号表后，用 `_work/scan_compat.py` 扫描 `vendor_boot` 339 个 +

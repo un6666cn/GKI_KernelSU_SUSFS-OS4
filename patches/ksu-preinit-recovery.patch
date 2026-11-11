@@ -1,0 +1,80 @@
+diff -ruN a/KernelSU/kernel/preinit/preinit.c b/KernelSU/kernel/preinit/preinit.c
+--- a/KernelSU/kernel/preinit/preinit.c	2026-11-11 09:13:51.454351900 +0800
++++ b/KernelSU/kernel/preinit/preinit.c	2026-11-11 09:14:22.033883100 +0800
+@@ -96,6 +96,22 @@
+     return !strcmp(buf, expected);
+ }
+ 
++/*
++ * Recovery keeps /system in the ramdisk, so /system/bin/recovery is the very
++ * file init uses to recognise it; a normal boot mounts the system partition,
++ * which has no such file.  Module preinit has nothing to run there (/metadata
++ * is not mounted) and must not take over PID 1's init exec.
++ */
++static bool ksu_preinit_in_recovery(void)
++{
++    struct path p;
++
++    if (kern_path("/system/bin/recovery", LOOKUP_FOLLOW, &p))
++        return false;
++    path_put(&p);
++    return true;
++}
++
+ bool ksu_preinit_handle_execve(const char __user **filename_user, const char __user *const __user *argv_user,
+                                int orig_nr, struct pt_regs *regs, long *ret)
+ {
+@@ -120,6 +136,14 @@
+     if (strcmp(path, INIT_PATH) || !is_selinux_setup(argv_user))
+         return false;
+ 
++    if (ksu_preinit_in_recovery()) {
++        file = xchg(&ksu_preinit_file, NULL);
++        if (file)
++            fput(file);
++        pr_info("preinit: recovery boot, skipping\n");
++        return false;
++    }
++
+     // One shot: the runner's own exec of the real init must pass through.
+     file = xchg(&ksu_preinit_file, NULL);
+     if (!file)
+diff -ruN a/KernelSU/kernel/preinit/runner/runner.c b/KernelSU/kernel/preinit/runner/runner.c
+--- a/KernelSU/kernel/preinit/runner/runner.c	2026-11-11 09:13:51.491474800 +0800
++++ b/KernelSU/kernel/preinit/runner/runner.c	2026-11-11 09:14:22.047616300 +0800
+@@ -92,6 +92,27 @@
+     kmsg_write(buf, n);
+ }
+ 
++/*
++ * Same as klog() but at KERN_EMERG.  The console is gated to emergency only
++ * on this port, and pstore records just the console, so a failure that kills
++ * PID 1 has to be logged at this level to survive the panic.
++ */
++static __attribute__((format(printf, 1, 2))) void klog_emerg(const char *fmt, ...)
++{
++    char buf[LOG_LINE_MAX];
++    va_list args;
++    int n;
++
++    n = snprintf(buf, sizeof(buf), "<0>ksu_preinit: ");
++    va_start(args, fmt);
++    n += vsnprintf(buf + n, sizeof(buf) - n - 1, fmt, args);
++    va_end(args);
++    if (n > (int)sizeof(buf) - 2)
++        n = sizeof(buf) - 2;
++    buf[n++] = '\n';
++    kmsg_write(buf, n);
++}
++
+ /* ------------------------------------------------------------------ utils */
+ 
+ static long now_ms(void)
+@@ -982,6 +1003,6 @@
+     }
+ 
+     execve(INIT_PATH, argv, envp);
+-    klog("exec " INIT_PATH " failed: %d", errno);
++    klog_emerg("exec " INIT_PATH " failed: %d", errno);
+     return 127;
+ }
