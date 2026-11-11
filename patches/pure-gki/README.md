@@ -143,7 +143,7 @@ pstore 读到 errno。
 
 ## 验收判据
 
-对产物 Image 重建符号表后，用 `_work/scan_compat.py` 扫描 `vendor_boot` 339 个 +
+对产物 Image 重建符号表后，用 `kernel_os4/tools/verify_kernel_compat.py` 扫描 `vendor_boot` 339 个 +
 `vendor_dlkm` 304 个 `.ko`：
 
 - 内核级缺失符号数 = 0
