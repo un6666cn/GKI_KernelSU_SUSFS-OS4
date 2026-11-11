@@ -1,0 +1,39 @@
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -4020,6 +4020,22 @@
+ static void cfi_init(struct module *mod);
+ 
+ /*
++ * This port replaces the vendor smart zram stack with built-in zram and
++ * zsmalloc (CONFIG_ZRAM=y, CONFIG_ZSMALLOC=y) so that zram keeps the kernel
++ * default compressor.  The vendor modules export the same zs_* symbols, so
++ * loading them fails ("exports duplicate symbol") and, in recovery, aborts
++ * first-stage init with exit 127 ("Attempted to kill init").  The kernel
++ * already provides what they would, so treat them as loaded.
++ */
++static bool meizu_superseded_module(const char *name)
++{
++	if (!name)
++		return false;
++	return !strcmp(name, "smart_zsmalloc") ||
++	       !strcmp(name, "smartswap_zram");
++}
++
++/*
+  * Allocate and load the module: note that size of section 0 is always
+  * zero, and we rely on this for optional sections.
+  */
+@@ -4062,6 +4078,13 @@
+ 	if (err)
+ 		goto free_copy;
+ 
++	if (meizu_superseded_module(info->name)) {
++		pr_info("module %s: superseded by built-in zram, skipping\n",
++			info->name);
++		free_copy(info);
++		return 0;
++	}
++
+ 	/*
+ 	 * Now that we know we have the correct module name, check
+ 	 * if it's blacklisted.
