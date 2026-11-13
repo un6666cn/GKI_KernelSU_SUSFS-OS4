@@ -1,0 +1,45 @@
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -2662,6 +2662,23 @@
+ 	{ }
+ };
+ 
++/*
++ * Accept writes but keep the compiled-in value, so userspace cannot
++ * override the kernel's memory reclaim defaults.
++ */
++static int proc_dointvec_keep(struct ctl_table *table, int write,
++			      void *buffer, size_t *lenp, loff_t *ppos)
++{
++	if (write) {
++		struct ctl_table tmp = *table;
++		int val = *(int *)table->data;
++
++		tmp.data = &val;
++		return proc_dointvec_minmax(&tmp, write, buffer, lenp, ppos);
++	}
++	return proc_dointvec_minmax(table, write, buffer, lenp, ppos);
++}
++
+ static struct ctl_table vm_table[] = {
+ 	{
+ 		.procname	= "overcommit_memory",
+@@ -2779,7 +2796,7 @@
+ 		.data		= &vm_swappiness,
+ 		.maxlen		= sizeof(vm_swappiness),
+ 		.mode		= 0644,
+-		.proc_handler	= proc_dointvec_minmax,
++		.proc_handler	= proc_dointvec_keep,
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_TWO_HUNDRED,
+ 	},
+@@ -2900,7 +2917,7 @@
+ 		.data		= &watermark_scale_factor,
+ 		.maxlen		= sizeof(watermark_scale_factor),
+ 		.mode		= 0644,
+-		.proc_handler	= watermark_scale_factor_sysctl_handler,
++		.proc_handler	= proc_dointvec_keep,
+ 		.extra1		= SYSCTL_ONE,
+ 		.extra2		= SYSCTL_THREE_THOUSAND,
+ 	},
