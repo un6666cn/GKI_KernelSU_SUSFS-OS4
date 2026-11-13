@@ -1,0 +1,24 @@
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -438,7 +438,7 @@
+ int min_free_kbytes = 1024;
+ int user_min_free_kbytes = -1;
+ int watermark_boost_factor __read_mostly = 15000;
+-int watermark_scale_factor = 10;
++int watermark_scale_factor = 150;
+ 
+ static unsigned long nr_kernel_pages __initdata;
+ static unsigned long nr_all_pages __initdata;
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -191,7 +191,7 @@
+ /*
+  * From 0 .. 200.  Higher means more swappy.
+  */
+-int vm_swappiness = 60;
++int vm_swappiness = 80;
+ 
+ static void set_task_reclaim_state(struct task_struct *task,
+ 				   struct reclaim_state *rs)
